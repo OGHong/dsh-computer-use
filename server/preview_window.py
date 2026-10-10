@@ -12,7 +12,7 @@
   - 整块画面可拖（对齐原生面板 setMovableByWindowBackground），不抢焦点、不进 Dock；
     拖完的位置记在 panel.pos 里，下次拉起还在原地（默认右下角）；
   - **完成勾与收起只看 agent 活动**（见 `_panel_state`）：这一轮还在跑就一直上屏；这一轮刚结束
-    就立刻打绿色 ✓，再安静 `DSH_CUA_HIDE_S`（默认 25 秒）收起。判据里**没有视频帧的 mtime** ——
+    就立刻打绿色 ✓，再安静 `DSH_CUA_HIDE_S`（默认 12 秒）收起。判据里**没有视频帧的 mtime** ——
     帧只决定「有没有东西可看」。拿不到 host 半区的 `turn.json` 时退回纯时间判定
     （`DSH_CUA_DONE_S` / `DSH_CUA_DORMANT_S`）。收起时写 `panel.state=hidden`，host 半区据此停掉抓屏；
   - 右上角 × = 「现在收起来」，**不是**「以后别再出现」：只 orderOut，进程留着，等 Agent
@@ -86,7 +86,8 @@ WIDTH = 320
 # 以前它挂在 latest.jpg 的 mtime 上，而 SCK 推流只要画面有变化（用户动一下鼠标、屏幕上任何
 # 动画）就重写那一帧 → ✓ 被抹掉。现在只有 agent 状态能影响它（见 `_panel_state`）。
 DONE_S = float(os.environ.get("DSH_CUA_DONE_S") or 8.0)     # 拿不到 agent 状态时的兜底：安静这么久 = 完成
-HIDE_S = float(os.environ.get("DSH_CUA_HIDE_S") or 25.0)    # 这一轮结束 + 安静这么久 → 收起（原来是 120 秒，太长了）
+HIDE_S = float(os.environ.get("DSH_CUA_HIDE_S") or 12.0)    # 这一轮结束 + 安静这么久 → 收起
+                                                            # （120 秒太长了；12 秒 = 绿 ✓ 看得清、又很快让开）
 DORMANT_S = float(os.environ.get("DSH_CUA_DORMANT_S") or 60.0)  # 拿不到 agent 状态时的兜底收起时间
 HIDE_QUIET_S = 120.0   # 点了 × 之后：Agent 安静够这么久 = 上一轮活儿干完了，解除收起
 IDLE_EXIT_S = 900.0   # 停手 15 分钟就整个退掉：任务完了不该留一个 ~35MB 的进程挂着，

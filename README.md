@@ -227,7 +227,7 @@ agent 作用域还允许复用同名 `serverName`（`dsh-mcp-client/lib/index.js
 `panel.pos` 里，下次拉起还在原地（默认右下角）。
 
 - **随用随现**：第一次真的操作电脑时自动拉起（`server.py` 的 `_note()` 里 `_ensure_panel()`），
-  这一轮结束、安静 `DSH_CUA_HIDE_S`（默认 25 秒）自己收起来，下一次动作自己回来，会话结束（MCP 服务器退出）随之退出，不留孤儿窗。
+  这一轮结束、安静 `DSH_CUA_HIDE_S`（默认 12 秒）自己收起来，下一次动作自己回来，会话结束（MCP 服务器退出）随之退出，不留孤儿窗。
   判据是 computer-use 自己的动作时间戳（status.txt / heartbeat），**不是「dsh 里有没有回合在跑」**
   ——否则你做写代码、聊天这类普通任务时窗也会被叫出来（`latest.jpg` 是跨会话留着的旧截图），
   实测踩过。`DSH_CUA_NO_PANEL=1` 可整条关掉；`preview(enable=True/False)` 手动强制显示/收起，
@@ -238,7 +238,7 @@ agent 作用域还允许复用同名 `serverName`（`dsh-mcp-client/lib/index.js
     `running` 来自 `agents` 服务）。于是浮窗知道「**这一轮还在不在跑**」，而不是只知道「最后一次
     动作多久以前」；
   - 浮窗侧是一个**纯函数** `_panel_state(now, agent_ts, running)`：`running` 为真 → 一直上屏；
-    这一轮刚结束 → **立刻**打绿 ✓（1.5 秒地板防抖），再安静 `DSH_CUA_HIDE_S`（默认 25 秒，原来
+    这一轮刚结束 → **立刻**打绿 ✓（1.5 秒地板防抖），再安静 `DSH_CUA_HIDE_S`（默认 12 秒，原来
     写死 120 秒）收起；拿不到 `turn.json`（老 host 半区）→ 退回纯时间判定（安静 `DSH_CUA_DONE_S`
     默认 8 秒打勾、`DSH_CUA_DORMANT_S` 默认 60 秒收起）。**输入里没有帧 mtime** —— SCK 推流只要
     画面有变化（用户动一下鼠标、屏幕上任何动画）就重写 `latest.jpg`，把判据挂在那上面就是那个 bug。
@@ -303,7 +303,7 @@ agent 作用域还允许复用同名 `serverName`（`dsh-mcp-client/lib/index.js
 |---|---|---|---|
 | 本插件工具服务器 | 稳态常驻 **16MB**（启动峰值 23.8MB；纯 CPython 3.12 解释器地板就有 12.3MB）/ 跑满一轮 33MB 峰值 | 84ms（含换 UIElement bundle 的一次 execve；首轮自建 bundle 再 +48ms） | dsh 里子进程实测；`lsof` 确认空载时一个系统框架都没映射（CDLL 也延迟到第一次真用）；全程无 AppKit/Quartz/pyobjc/pydantic/httpx/Pillow/pyautogui |
 | 抓屏 helper | **没人看 = 0 进程**；在看 30MB / 4.8% CPU | — | 没人看约 6 秒后自己退出，系统录屏灯跟着灭；缩放走 vImage 而不是 CoreImage，省下 11MB 与整条 Metal 管线 |
-| 预览浮窗（独立进程，用到才起） | ~35MB | — | 与 MCP 服务器同生共死；这一轮结束 + 安静 `DSH_CUA_HIDE_S`（默认 25 秒）只 orderOut 不退出，所以下一次动作立刻回来；点 × 同样只 orderOut（安静 `HIDE_QUIET_S` 后自己回来），不再制造「关了就打不开」的粘性状态 |
+| 预览浮窗（独立进程，用到才起） | ~35MB | — | 与 MCP 服务器同生共死；这一轮结束 + 安静 `DSH_CUA_HIDE_S`（默认 12 秒）只 orderOut 不退出，所以下一次动作立刻回来；点 × 同样只 orderOut（安静 `HIDE_QUIET_S` 后自己回来），不再制造「关了就打不开」的粘性状态 |
 | Qoder computer-use | bridge 10MB 常驻 + runtime ~52MB 按需 | — | 他们的 runtime 会话结束就退，所以纯空载比我们要小；真在用电脑时是 62MB 级 |
 
 ZCode 的 computer-use 进程本机当前没在跑，量不到，只作为形态参照。

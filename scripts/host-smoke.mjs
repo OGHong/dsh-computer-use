@@ -356,7 +356,7 @@ mod.apply(withAgents('idle'))
 mod.housekeeping()
 const turn2 = JSON.parse(readFileSync(turnFile, 'utf8'))
 if (turn2.running !== false) throw new Error(`回合结束后 turn.json 没更新：${JSON.stringify(turn2)}`)
-console.log('✓ turn.json：回合结束 → running=false（浮窗据此 25 秒后收起、并打完成勾）')
+console.log('✓ turn.json：回合结束 → running=false（浮窗据此 12 秒后收起、并打完成勾）')
 
 // panel.state：收起之后就别再抓屏了（抓屏进程活着 = 系统录屏灯亮着）
 const stateFile = `${DIR}/panel.state`
