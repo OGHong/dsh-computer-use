@@ -1774,10 +1774,9 @@ def screen_info() -> str:
         f"辅助功能权限（点击/键盘必需）: {'已授予' if ax_ok else '未授予（系统设置→隐私与安全性→辅助功能→添加 DeepSeek Harness）' if ax_ok is False else '未知'}",
         f"屏幕录制权限（截屏必需）: {'已授予' if scr else '未授予（系统设置→隐私与安全性→屏幕录制→添加 DeepSeek Harness）' if scr is False else '未知'}",
         f"已绑定应用: {bound}" + (f"（binding_id={_binding['id']}）" if _binding["id"] else ""),
-        "会话隔离: ⚠️ 这个服务器进程被本 DSH 实例的**所有会话**共用，绑定/租约/观察器都是进程内共享状态；"
-        "动作带 binding_id 才能在绑定被别人改掉时被拦住（ERROR[BINDING_CHANGED]）。",
         killswitch.state_line(),
         f"控制器租约: {lease.describe(_holder())}",
+        _isolation_line(),
         _session_line(),
     ]
     return "\n".join(lines)
@@ -1942,13 +1941,33 @@ def _holder() -> str:
     return _CALL_KEY[0]
 
 
+def _identity_enabled() -> bool:
+    """host 半区是否真的在写 `caller.json`（有身份 = 每个会话一份绑定/租约）。"""
+    return not set(_SESSIONS) <= {_SHARED}
+
+
 def _session_line() -> str:
     """screen_info 用的一行：身份从哪来、现在分了几个会话的状态。"""
-    if set(_SESSIONS) <= {_SHARED}:
+    if not _identity_enabled():
         return ("会话身份: 未启用（host 半区没有写 caller.json）—— 绑定与租约是**进程级共享**的，"
                 "多会话会互相覆盖；升级插件的 host 半区即可启用按会话隔离。")
     return (f"会话身份: 已启用（每个会话一份绑定/租约，共 {len(_SESSIONS)} 个会话有状态）；"
             f"当前调用属于 {_holder()}。")
+
+
+def _isolation_line() -> str:
+    """screen_info 用的一行：隔离模型是什么，以及 binding_id 到底在防什么。
+
+    必须随身份是否启用而变：身份启用后「绑定会被别的会话改掉」已不成立，再那么说会把模型
+    引向多余的防御（每步都带令牌、不敢信任自己的绑定）。身份未启用时保留旧的共享告警。
+    """
+    if _identity_enabled():
+        return ("会话隔离: 每会话一份绑定/租约（host 半区在写 caller.json）—— 别的会话改的是它自己那份，"
+                "动不到你的，观察器按 pid 共享（同一个应用本来就该共享索引）。"
+                "binding_id 仍建议带上：它现在拦的是**你自己**重新 get_app 之后拿旧索引继续操作"
+                "（ERROR[BINDING_CHANGED]，动作一次都不会下发）。")
+    return ("会话隔离: ⚠️ 这个服务器进程被本 DSH 实例的**所有会话**共用，绑定/租约/观察器都是进程内共享状态；"
+            "动作带 binding_id 才能在绑定被别人改掉时被拦住（ERROR[BINDING_CHANGED]）。")
 
 
 def _binding_app() -> str:
