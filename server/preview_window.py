@@ -15,11 +15,13 @@
     就立刻打绿色 ✓，再安静 `DSH_CUA_HIDE_S`（默认 12 秒）收起。判据里**没有视频帧的 mtime** ——
     帧只决定「有没有东西可看」。拿不到 host 半区的 `turn.json` 时退回纯时间判定
     （`DSH_CUA_DONE_S` / `DSH_CUA_DORMANT_S`）。收起时写 `panel.state=hidden`，host 半区据此停掉抓屏；
-  - 右上角 × = 「现在收起来」，**不是**「以后别再出现」：只 orderOut，进程留着，等 Agent
-    安静够 HIDE_QUIET_S（默认 2 分钟，说明上一轮活儿干完了）之后的下一次动作，它自己回来
-    —— 用户不需要去找任何「重新打开」的入口（用户侧本来也没有：没有菜单栏图标、没有 Dock、
-    没有 GUI 开关）。真正「以后别再自动出现」是另一件事，只有 Agent 的 preview(enable=False)
-    能做：它写 panel.hidden=off，并在工具结果里明确给出恢复办法；
+  - 右上角 × = 「**这一轮**先别给我看」，**不是**「以后别再出现」：只 orderOut，进程留着，
+    这一轮里一直算数（Agent 在思考、读文件时照样算这一轮没结束），等**下一轮开始**（host 半区的
+    `turn.json` 里 running 由否转是）它自己回来 —— 用户不需要去找任何「重新打开」的入口
+    （用户侧本来也没有：没有菜单栏图标、没有 Dock、没有 GUI 开关）。判据**不是**「安静了多久」：
+    安静只说明它没在碰电脑，不说明它收工了（见 `_hide_expired`）。拿不到 `turn.json` 时退回
+    时间判定（安静 HIDE_QUIET_S 后解除）。真正「以后别再自动出现」是另一件事，只有 Agent 的
+    preview(enable=False) 能做：它写 panel.hidden=off，并在工具结果里明确给出恢复办法；
   - 左上角 ⏹ / ▶ = **急停开关**（设计任务书 §3.5 的第三档）：写的是与
     server/killswitch.py 同一个 `kill` 文件，MCP 服务器在下一个可中断点（≤0.1 秒）进入只读，
     动作类工具从此回 ERROR[KILLED]。急停期间浮窗**一直显示**（否则用户找不到恢复入口），
@@ -89,7 +91,8 @@ DONE_S = float(os.environ.get("DSH_CUA_DONE_S") or 8.0)     # 拿不到 agent �
 HIDE_S = float(os.environ.get("DSH_CUA_HIDE_S") or 12.0)    # 这一轮结束 + 安静这么久 → 收起
                                                             # （120 秒太长了；12 秒 = 绿 ✓ 看得清、又很快让开）
 DORMANT_S = float(os.environ.get("DSH_CUA_DORMANT_S") or 60.0)  # 拿不到 agent 状态时的兜底收起时间
-HIDE_QUIET_S = 120.0   # 点了 × 之后：Agent 安静够这么久 = 上一轮活儿干完了，解除收起
+HIDE_QUIET_S = 120.0   # **拿不到轮次状态时**的兜底解除时间（能拿到 turn.json 时只看「下一轮
+                       # 开始了没有」，与安静多久无关 —— 见 _hide_expired）
 IDLE_EXIT_S = 900.0   # 停手 15 分钟就整个退掉：任务完了不该留一个 ~35MB 的进程挂着，
                       # 下一次动作 server 会再把它拉起来（落点照 panel.pos 恢复）
 MARGIN = 16
@@ -127,7 +130,10 @@ def _turn_running() -> bool | None:
 		rec = json.loads(TURN.read_text(encoding="utf-8"))
 		if time.time() * 1000 - int(rec.get("at") or 0) > 15000:   # host 半区每 4 秒续一次
 			return None
-		return bool(rec.get("running"))
+		raw = rec.get("running")
+		if raw is None:      # host 拿不到 agents 服务时写的是 null：那是「不知道」，不是「没在跑」
+			return None
+		return bool(raw)
 	except (OSError, ValueError, TypeError):
 		return None
 
@@ -168,13 +174,27 @@ def _save_panel_state(up: bool) -> None:
 		pass
 
 
-def _hide_expired(hide_at: float | None, agent_ts: float, now: float) -> bool:
-	"""「现在收起来」该解除了吗：Agent 已经安静 HIDE_QUIET_S。
+def _hide_expired(hide_at: float | None, agent_ts: float, now: float,
+                  running: bool | None, prev_running: bool | None) -> bool:
+	"""用户按下的 × 该解除了吗 —— 解除的判据是**下一轮开始了**，不是「安静了多久」。
 
-	为什么不是「下一次动作就回来」：用户点 × 往往正是为了在 Agent 连续操作时把它挪开，
-	动作一来就弹回去等于没关。安静够 2 分钟说明那一轮活儿结束了，这时解除收起，
-	用户下一次让 Agent 干活时浮窗自己回来 —— 不需要任何恢复入口。"""
-	return hide_at is not None and now - agent_ts >= HIDE_QUIET_S
+	× 的语义：这一轮别给我看，下一轮该弹还得弹。所以：
+
+	  * 这一轮还在跑（running 为真）→ 一直算数。**绝不能拿「安静多久」当轮次结束**：
+	    status.txt / heartbeat 只有 computer-use 调用会碰（server.py 的 `_note()`），Agent 在想事情、
+	    读文件、写代码时同样是「安静」，可这一轮远没结束。以前就是这么判的，于是用户点完 ×
+	    窗被自己收起又立刻拉起（实测：安静已 195 秒时点 ×，0.30 秒后窗回到屏上，看着像点了没反应；
+	    即使安静不足 120 秒，也总在安静到 120 秒那一刻自己弹回来）。
+	  * 看到 running 由**假**转**真** = 新一轮开始 → 解除，浮窗照常自己上屏。必须是与「假」比较，
+	    不是与「不是真」比较：`None`（拿不到状态）→ 真只是「刚从看不到变成看得到」，那不是新一轮
+	    开始的沿，照它解除就等于把用户按下的 × 又撤销一次。
+	  * 拿不到轮次状态（running is None）→ 退回纯时间判定（此时没有更好的信号）。
+	"""
+	if hide_at is None:
+		return False
+	if running is None:
+		return now - agent_ts >= HIDE_QUIET_S
+	return prev_running is False and running is True
 
 
 def _request_hide() -> None:
@@ -513,7 +533,7 @@ def main():
 	panel.makeKeyAndOrderFront_(None)
 	panel.orderFrontRegardless()
 
-	state = {"shown": None, "up": False}
+	state = {"shown": None, "up": False, "turn": None}
 
 	def tick(timer):  # noqa: ARG001 - NSTimer block 签名
 		if not _parent_alive() or _QUIT:
@@ -522,11 +542,14 @@ def main():
 			return
 		now = time.time()
 		agent_ts = _agent_ts()
-		if _hide_expired(_HIDE_AT, agent_ts, now):
-			_release_hide()      # 上一轮活儿干完了：回到自动模式，下一次动作浮窗自己回来
+		running = _turn_running()
+		release = _hide_expired(_HIDE_AT, agent_ts, now, running, state["turn"])
+		state["turn"] = running       # 先记下这一拍：下一拍才判得出「新一轮开始」这个沿
+		if release:
+			_release_hide()           # 下一轮开始了：回到自动模式，浮窗照常自己上屏
 		killed = _kill_on()
 		content._refresh_stop(killed)
-		up, done = _panel_state(now, agent_ts, _turn_running())
+		up, done = _panel_state(now, agent_ts, running)
 		# 只在「藏 ↔ 显」切换时动窗口层级：每 250ms 反复 orderFront 是无谓的窗口服务
 		# 抖动（用户实测期间出现过两次 Mission Control，先把这个嫌疑源去掉）。
 		# 急停期间**一直显示**：▶ 是用户侧唯一的恢复入口，把它藏起来等于让用户没法恢复。

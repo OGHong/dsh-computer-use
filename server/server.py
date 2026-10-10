@@ -313,9 +313,9 @@ def _panel_start() -> bool:
 def _panel_user_hidden() -> bool:
     """是不是被**明确**关掉了（panel.hidden 以 off 开头）。
 
-    只有 preview(enable=False) 会写 off。浮窗上那个 × 写的是 "hide:" —— 那是「现在收起来」，
-    由浮窗进程自己管（安静 HIDE_QUIET_S 之后下一次动作自己回来），server 不该据此拒绝自动
-    拉起：用户随手一点 ×，不该换来一个他再也找不到开关去恢复的状态。"""
+    只有 preview(enable=False) 会写 off。浮窗上那个 × 写的是 "hide:" —— 那是「这一轮先别给我看」，
+    由浮窗进程自己管（这一轮一直算数，下一轮开始自己回来，见 preview_window.py 的 `_hide_expired`），
+    server 不该据此拒绝自动拉起：用户随手一点 ×，不该换来一个他再也找不到开关去恢复的状态。"""
     try:
         return PANEL_HIDDEN.read_text(encoding="utf-8").strip().startswith("off")
     except OSError:
@@ -2674,13 +2674,13 @@ def preview(enable: bool = True) -> str:
     """显示/隐藏 OS 级实时预览浮窗（唯一的预览面）。
 
     浮窗浮在所有应用之上、可以拖到桌面任意位置（含 dsh 窗口之外），本来就会在第一次
-    电脑操作时自动出现、停手 2 分钟自己藏起来、下一次动作自己回来；这个开关用来强制
+    电脑操作时自动出现、这一轮结束安静一会儿自己藏起来、下一轮开始又自己回来；这个开关用来强制
     显示（并把它的坐标报给你，便于拖动或点它的 ×）或明确收起。
 
     注意 enable=false 是**粘性**的：它写 panel.hidden=off，之后所有电脑操作都不再自动拉起
     浮窗，用户也看不到操作画面 —— 而用户侧没有恢复入口，只有 preview(enable=true) 能解除。
     所以只在用户明确说「以后别再弹」时才用它；用户只说「把窗口关了 / 关掉你开的窗口」时
-    不要调它，浮窗上的 × 已经是「现在收起来」，自己会回来。
+    不要调它，浮窗上的 × 已经是「这一轮先别给我看」，下一轮开始它自己会回来。
     """
     if not enable:
         _panel_remember("off")          # 粘性 opt-out：用户侧没有恢复入口，只能靠 preview(True)

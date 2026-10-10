@@ -243,6 +243,9 @@ agent 作用域还允许复用同名 `serverName`（`dsh-mcp-client/lib/index.js
     默认 8 秒打勾、`DSH_CUA_DORMANT_S` 默认 60 秒收起）。**输入里没有帧 mtime** —— SCK 推流只要
     画面有变化（用户动一下鼠标、屏幕上任何动画）就重写 `latest.jpg`，把判据挂在那上面就是那个 bug。
     这一段的矩阵由 `scripts/panel-check.py` 打（含「鼠标移动不改变结论」那条）；
+  - 同一个 `running` 还管第二件事：用户点过的 × 什么时候解除。那是另一个纯函数
+    `_hide_expired(hide_at, agent_ts, now, running, prev_running)`，判据同样只看轮次
+    （**下一轮开始**才解除），绝不看「安静了多久」—— 见下面 × 那条。
   - 浮窗收起时写 `panel.state=hidden`，host 半区据此**停掉抓屏**（原来只要进程还在就一直抓，
     收起后还能白抓两分钟 —— 抓屏进程活着 = 系统录屏灯亮着）。
 - **左上角 ⏹ / ▶ 是急停开关**（§3.5 第三档）：按下写 `$DSH_CUA_DIR/kill`，MCP 服务器在下一个
@@ -250,15 +253,21 @@ agent 作用域还允许复用同名 `serverName`（`dsh-mcp-client/lib/index.js
   **一直显示**（这是用户侧唯一的恢复入口，藏起来等于让用户没法恢复），底色转红、按钮变 ▶。
   为什么走文件而不是 HTTP 或工具调用：那一刻 MCP 服务器正卡在某个动作里，工具调用那条路走不通。
   写的是临时文件再 `os.replace` —— 服务器每 120ms 就可能读一次，半个文件会被读成「没停」。
-- **× 是「现在收起来」，不是「以后别再出现」**（这条是真事故）：以前 × 和  `preview(enable=False)` 写的是同一个 `panel.hidden=off`，于是用户随手点一下 × 就等于打开了一个
+- **× 是「这一轮先别给我看」，不是「以后别再出现」**（这条是真事故）：以前 × 和  `preview(enable=False)` 写的是同一个 `panel.hidden=off`，于是用户随手点一下 × 就等于打开了一个
   粘性 opt-out —— 而用户侧没有任何恢复入口（没有菜单栏图标、没有 Dock、GUI 里也没有开关，内嵌
   卡片已退休），只能求 Agent 调 `preview(True)`，或者知道 `/tmp/dsh-computer-use/panel.hidden`
-  这个文件名。现在拆成两件事：× 只 orderOut（写 `panel.hidden=hide:<ts>`，进程留着），等 Agent
-  安静够 `HIDE_QUIET_S`（默认 2 分钟 = 上一轮活儿干完了）之后的下一次动作自己回来 —— 用户不需要
-  找任何「重新打开」的入口；「以后别再自动出现」只归 `preview(enable=False)`，它仍是粘性的，
-  但结果文案明确写出恢复办法，且 off 期间每个动作的结果尾部都会带上那条提示（v2 里它是结构化
-  hint 码：动作层只塞 `detail["hints"]`，文案在 `action_layer.HINTS`，v1 那句 `_panel_hint()`
-  已随分层一起去掉），Agent 不会在用户已经失去监督面的情况下继续闷头操作。
+  这个文件名。现在拆成两件事：× 只 orderOut（写 `panel.hidden=hide:<ts>`，进程留着），**这一轮里
+  一直算数**，等**下一轮开始**（`turn.json` 里 running 由否转是）自己回来 —— 用户不需要找任何
+  「重新打开」的入口。解除的判据是**轮次**，不是「安静了多久」：2026-10-11 用户报「观察窗又无法
+  手动关闭了」，根因就是 `_hide_expired` 还在用 `turn.json` 出现之前的假设（「安静 2 分钟 =
+  上一轮活儿干完了」）—— 而 `status.txt` / `heartbeat` 只有 computer-use 调用会碰，Agent 在思考、
+  读文件、写代码时同样「安静」，这一轮远没结束。实测：安静已 195 秒时点 ×，0.30 秒后窗回到屏上；
+  安静不足 120 秒时，也总在安静到 120 秒那一刻自己弹回来。现在解除只看「下一轮开始了没有」，
+  拿不到 `turn.json`（老 host 半区，或 host 拿不到 `agents` 服务、写的是 `"running": null`）时
+  才退回时间判定 `HIDE_QUIET_S`（默认 2 分钟）。「以后别再自动出现」只归 `preview(enable=False)`，
+  它仍是粘性的，但结果文案明确写出恢复办法，且 off 期间每个动作的结果尾部都会带上那条提示
+  （v2 里它是结构化 hint 码：动作层只塞 `detail["hints"]`，文案在 `action_layer.HINTS`，
+  v1 那句 `_panel_hint()` 已随分层一起去掉），Agent 不会在用户已经失去监督面的情况下继续闷头操作。
 - **Host 侧的推流闸门跟着浮窗走**：浮窗不像卡片那样轮询 HTTP，它只读 `latest.jpg` + 把 pid 写进
   `preview.lock`，所以 Host 半区认这个 pid 决定要不要喂帧（`npm run check` 里四条断言分别钉住
   「普通任务不该开录屏」「在用电脑时要补帧」「浮窗在跑时要补帧」「**不靠任何 HTTP 请求也要起流**」）。
@@ -303,7 +312,7 @@ agent 作用域还允许复用同名 `serverName`（`dsh-mcp-client/lib/index.js
 |---|---|---|---|
 | 本插件工具服务器 | 稳态常驻 **16MB**（启动峰值 23.8MB；纯 CPython 3.12 解释器地板就有 12.3MB）/ 跑满一轮 33MB 峰值 | 84ms（含换 UIElement bundle 的一次 execve；首轮自建 bundle 再 +48ms） | dsh 里子进程实测；`lsof` 确认空载时一个系统框架都没映射（CDLL 也延迟到第一次真用）；全程无 AppKit/Quartz/pyobjc/pydantic/httpx/Pillow/pyautogui |
 | 抓屏 helper | **没人看 = 0 进程**；在看 30MB / 4.8% CPU | — | 没人看约 6 秒后自己退出，系统录屏灯跟着灭；缩放走 vImage 而不是 CoreImage，省下 11MB 与整条 Metal 管线 |
-| 预览浮窗（独立进程，用到才起） | ~35MB | — | 与 MCP 服务器同生共死；这一轮结束 + 安静 `DSH_CUA_HIDE_S`（默认 12 秒）只 orderOut 不退出，所以下一次动作立刻回来；点 × 同样只 orderOut（安静 `HIDE_QUIET_S` 后自己回来），不再制造「关了就打不开」的粘性状态 |
+| 预览浮窗（独立进程，用到才起） | ~35MB | — | 与 MCP 服务器同生共死；这一轮结束 + 安静 `DSH_CUA_HIDE_S`（默认 12 秒）只 orderOut 不退出，所以下一次动作立刻回来；点 × 同样只 orderOut 但**这一轮一直算数**（下一轮开始才自己回来），不再制造「关了就打不开」的粘性状态 |
 | Qoder computer-use | bridge 10MB 常驻 + runtime ~52MB 按需 | — | 他们的 runtime 会话结束就退，所以纯空载比我们要小；真在用电脑时是 62MB 级 |
 
 ZCode 的 computer-use 进程本机当前没在跑，量不到，只作为形态参照。
