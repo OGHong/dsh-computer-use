@@ -1,0 +1,71 @@
+{
+  "name": "dsh-computer-use",
+  "version": "0.8.0",
+  "description": "让 Agent 看屏幕、动鼠标键盘：内置 computer-use MCP 服务器（截屏/点击/打字/快捷键/滚动/启动应用/带观察的批量动作/急停/控制器租约/shell），以 mcp__computer-use__* 工具出现在会话中",
+  "license": "MIT",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "LICENSE",
+    "README.md",
+    "bin/cua_capture",
+    "capture/cua_capture.swift",
+    "cordis.patch.yml",
+    "lib/index.js",
+    "scripts/build_capture.sh",
+    "scripts/install.sh",
+    "server/action_layer.py",
+    "server/ax_bridge.py",
+    "server/ax_error.py",
+    "server/cg_input.py",
+    "server/killswitch.py",
+    "server/lease.py",
+    "server/mcp_stdio.py",
+    "server/preview_window.py",
+    "server/requirements.txt",
+    "server/server.py",
+    "server/ui_element_app.py"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "dsh",
+    "cordis",
+    "mcp",
+    "computer-use"
+  ],
+  "engines": {
+    "node": ">=22.6"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json",
+    "check": "sh -n scripts/install.sh && sh -n scripts/build_capture.sh && node scripts/client-smoke.mjs && node scripts/host-smoke.mjs && sh scripts/lint_py.sh && .venv/bin/python scripts/mcp_wire_check.py",
+    "verify": "npm run typecheck && npm run build && npm run check",
+    "smoke": "node scripts/host-smoke.mjs",
+    "smoke:client": "node scripts/client-smoke.mjs",
+    "build:capture": "sh scripts/build_capture.sh",
+    "install:local": "sh scripts/install.sh",
+    "lint": "sh scripts/lint_py.sh",
+    "wire": ".venv/bin/python scripts/mcp_wire_check.py"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "~4.0.4"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.4",
+    "typescript": "^7.0.2"
+  }
+}

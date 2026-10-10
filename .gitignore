@@ -1,0 +1,15 @@
+# 依赖与隔离开发目录（SOP 04：任何测试都不许写 ~/.dsh）
+node_modules/
+.dsh-dev/
+# 本机生成物：runtime/ 是 ui_element_app 在首次运行时按本机解释器生成的 LSUIElement
+# bundle（符号链接指向本机 .venv），换机器必须重新生成，绝不能进版本库或发布包
+runtime/
+.venv/
+__pycache__/
+*.pyc
+# 构建产物：src/ 是唯一真源，lib/ 由 `npm run build` 生成
+lib/
+# 抓屏 helper 的编译产物（scripts/build_capture.sh 生成）
+bin/cua_capture
+*.log
+.DS_Store

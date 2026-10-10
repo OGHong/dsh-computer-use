@@ -1,0 +1,3 @@
+# 工具服务器只用标准库 + pyobjc（pyobjc 只在富文本粘贴与 OS 级观察面板里用到，
+# 且都是用到才 import；坐标/输入路径全部是纯 ctypes，见 cg_input.py）。
+pyobjc-framework-Cocoa>=10
