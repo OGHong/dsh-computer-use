@@ -825,7 +825,19 @@ def index_epoch() -> int:
 
 
 def bump_index_epoch() -> int:
-    """开一个新纪元：已有观察器的下一个索引也抬到新基数，之后分配的数字只增不减。"""
+    """开一个新纪元：已有观察器的下一个索引也抬到新基数，之后分配的数字只增不减。
+
+    **前提（调用方必须保证，`server._bind_app()` 是唯一的调用点）**：
+
+    1. **单线程**：只在没有动作在跑的时候调（MCP 分发是单线程的，`_bind_app` 在调用栈里同步执行，
+       所以成立）。若将来并行化，必须把「读 `_epoch` → 分配 idx」整段放进 `_LOCK`，
+       否则两个线程可能拿到同一个数字。
+    2. **只在换绑定时调，且每次换绑都必须调**：不变式是「纪元 N 期发出的索引 < 纪元 N+1 期的基数」。
+       漏调一次，两个绑定期的索引空间就会重叠，`node_by_index` 又可能命中同号元素
+       —— 那正是这个机制要防的「静默点到别的应用上」。
+    3. 不变式成立还依赖「同一观察器在一个纪元里新增的节点数 < `_EPOCH_STEP`」：每次观察上限
+       `max_nodes` ≤ 2000，留了 50 倍余量；真要调大 `_EPOCH_STEP` 或 `max_nodes`，两个一起看。
+    """
     _epoch[0] += _EPOCH_STEP
     with _LOCK:
         for obs in _OBSERVERS.values():
@@ -833,7 +845,59 @@ def bump_index_epoch() -> int:
     return _epoch[0]
 
 
+def _pid_alive(pid: int) -> bool:
+    """这个应用还在吗（EPERM 当成活着：别人的进程不许我们发信号，不代表它没了）。"""
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+    return True
+
+
+def forget_observer(pid: int) -> bool:
+    """丢掉一个应用的观察器（连同它攥着的 AX 元素引用）。返回是否真的丢了一份。"""
+    with _LOCK:
+        obs = _OBSERVERS.pop(int(pid), None)
+    if obs is None:
+        return False
+    obs.forget()
+    return True
+
+
+def prune_observers() -> list[int]:
+    """回收**已经退出的应用**留下的观察器，返回被回收的 pid 列表。
+
+    为什么必须做（`forget()` 曾经是死代码）：观察器按 pid 建了就一直在 `_OBSERVERS` 里，
+    每个节点都持有一份 retain 过的 AXUIElementRef，还有整棵树的快照。一轮任务里开开关关十几个
+    应用（启动器、计算器、预览…），这些引用就一直挂着 —— 这是实打实的泄漏，而且退出的是**别人的**
+    进程，AX 不会替我们回收。
+
+    只在 `observer_for()` 里顺手扫一遍（观察器本来就只有个位数，`kill(pid,0)` 是微秒级），
+    不引额外定时器。调用方也可以显式点名回收（见 `server._resolve_app` 处理「绑定应用已退出」）。
+    """
+    with _LOCK:
+        dead = [pid for pid in _OBSERVERS if not _pid_alive(pid)]
+    for pid in dead:
+        forget_observer(pid)
+    return dead
+
+
+def forget_all() -> int:
+    """丢掉全部观察器（急停/收工时的兜底）。返回丢掉的份数。"""
+    with _LOCK:
+        count = len(_OBSERVERS)
+    for pid in [p for p in _OBSERVERS]:
+        forget_observer(pid)
+    return count
+
+
 def observer_for(pid: int) -> AppObserver:
+    """取（或新建）某个应用的观察器；顺手回收已经退出的应用留下的那些。"""
+    prune_observers()
     with _LOCK:
         if pid not in _OBSERVERS:
             _OBSERVERS[pid] = AppObserver(pid)

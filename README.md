@@ -134,63 +134,69 @@ TypeError）；`sequence` 的**内层** args 走同一个转换（SDK 的校验�
 **用户接管检测**是启发式的：记住我们上一次动作落下的光标位置，下一次动作前发现它自己动过
 （>12pt 且间隔 >0.7 秒）就在结果里提示「可能用户正在接管，先停下来问他」——只提示、不阻断。
 
-## 多会话：一个 DSH 实例里的多个会话（任务书《computer-use 多会话隔离》）
+## 多会话：一个 DSH 实例里的多个会话
 
 **根因**：这个 MCP 服务器是**宿主级单例** —— 一条 `insert` 让整个 DSH 实例只起一个 `server.py`，
-而它服务的会话可能有七八个。绑定（`_bound_app`）、租约（`lease._mine`）、AX 观察器全是**进程内
-全局状态**，所以会话 A 的动作可能落到会话 B 绑定的应用上（实测事故：绑定从「计算器」变成
-「DeepSeek Harness」，`release_lease` 释放掉的是别人的租约）。租约也没能挡住：租约文件是
-`leases/<持有进程 pid>.json`，而所有会话的持有者都是同一个 pid，`guard()` 必然跳过它。
+而它同时服务七八个会话。绑定（`_bound_app`）、租约（`lease._mine`）、观察器都是**进程内全局状态**，
+于是会话 A 的动作可能落到会话 B 绑定的应用上（实测事故：绑定从「计算器」变成「DeepSeek Harness」，
+`release_lease` 释放掉的是别人的租约）。租约也挡不住：租约文件是 `leases/<持有进程 pid>.json`，
+而所有会话的持有者都是同一个 pid，`guard()` 必然跳过它。
 
-已经落地的三道防线（都在单进程内生效，不需要模型配合的排在最前）：
+**修法：host 半区交出调用者身份，服务器按会话分份（B 方案，已落地）。**
 
-1. **索引纪元**（`ax_bridge.bump_index_epoch`，结构性）：每次换绑都把索引分配的起点抬高十万位，
-   于是**两个绑定期发出去的索引在数值上永不重叠**。会话 A 拿着计算器的 `[112]`，在会话 B 改过绑定
-   之后只会拿到 `ELEMENT_UNAVAILABLE`（响亮地失败，提示重新观察），**不可能命中新应用树里的同号元素**。
-   这一条把任务书 §2.4 那个「静默点到别的应用上」从结构上消掉了，且模型什么都不用做。
-2. **绑定令牌**（`binding_id`，任务书 §4.2）：`get_app` / `get_ax_state` 的返回里回显一枚令牌，
-   动作类工具（含 `sequence`、`release_lease`）可以带上它；对不上就返回 `ERROR[BINDING_CHANGED]`
-   并且**一次都不下发**。没带 = 放行（可选参数，不打断老会话与坐标路径），但结果尾部会提醒一句
-   「本次没带 binding_id」，提示模型自我纠正。`release_lease(binding_id=…)` 对不上时**拒绝释放**，
-   不会把别的会话的控制器夺走。
-3. **诚实报告**：`screen_info` 里直接写明「这个服务器进程被本 DSH 实例的所有会话共用」，
-   并把当前 `binding_id` 报出来。
+stdio MCP 协议**不带任何身份字段**（`dsh-mcp-client` 只发 `{name, arguments}`，参数还是 `deepFreeze`
+的，钩子改不了 —— 见 `dsh-tools/README.md:230`）。唯一知道「这次调用属于哪个会话」的地方是 host 半区：
 
-**还没做到的（任务书 §4.1 主修，已调研、未硬改）**：真正的隔离要让**每个 agent 拥有自己的
-`server.py` 进程**。DSH 有官方形态，第一方先例就是 `dsh-acp`：
-
-```js
-// dsh/node_modules/@deepseek-ai/dsh-acp/lib/index.js:216-219（归档内行号）
-async function mountAcpMcpServers(agentCtx, servers, sessionCwd) {
-  for (const config of resolveMcpConfigs(servers, sessionCwd)) await agentCtx.plugin(McpClient, config);
-}
+```
+tools/pre-execute (exec.agent.id = session-78c637…)
+        │  ① 闸门：computer-use 调用一次只放一个过去（否则 caller.json 归谁后写的就归谁）
+        │  ② 原子写 $DSH_CUA_DIR/caller.json = {agent, tool, seq, at}
+        ▼
+server.py 每次 tools/call 开头读它 → 绑定/令牌/租约按会话分份 → 用完存回
 ```
 
-`agent/created` 事件交付 `agent.ctx`（一个 scope fiber），`agent.ctx.plugin(McpClient, config)` 就是
-「一个 agent 一份 MCP 客户端 = 一个子进程」，fiber 销毁时 SDK 会把子进程 SIGTERM/SIGKILL；
-agent 作用域还可以复用同名 `serverName`（`dsh-mcp-client/lib/index.js:768-772` 与它的 README:128
-明确写了这是设计内行为）。**但第三方插件拿不到那个模块**：本插件的 host 半区实测
-`import('@deepseek-ai/dsh-mcp-client')` → `ERR_MODULE_NOT_FOUND`（桌面 app 的副本在
-`app.asar/dsh/node_modules` 里，不在插件的解析链上；profile 的 node_modules 里也没有它）。
-要自己走通这条路，就得在 host 半区**自建一个 MCP 客户端**（JSON-RPC over stdio + `ctx.tools.register`
-的工具定义/结果映射 + 图片投影 —— 后者要接 `attachments` / `llm.resolveModelInfo` 才能让截图仍然
-以图片回给模型）。那是一次架构级改动、直接压在「工具能不能被注册出来」这条生死线上，**按任务书
-§4.1「如果发现做不到，停下来报告，不要硬改」，这里停住并报告**，把选择权交回用户。
+实测（隔离 headless 里挂探针）：`pre-execute` 拿得到 `exec.agent.id`，而且钩子是**真的闸门**
+—— 在 pre 里 sleep 2 秒，工具就真的等满 2 秒才跑（内置 `read` 只花 0ms）；错误路径也有
+`post-execute`。`post-execute` / `result` / 150 秒保险丝三条路都能放行，重复或迟到的 post 按序号
+幂等忽略（不会把闸门错误地交给别人）。
 
-顺带记下调研否掉的两条路：`dsh-subprocess` 管不到 SDK 自己 spawn 的进程（README:150
-「SDK-managed spawns remain outside」）；host 侧 `tools/pre-execute` 钩子能拿到 `exec.agent.id`
-并 allow/deny/ask，但 `exec.arguments` 是被 `deepFreeze` 的、官方明说**有意不允许改写**
-（`dsh-tools/README.md:230`），所以「在钩子里补会话身份」也不成立。
+真实回归（一个 DSH 实例 + 两个并发 subagent + 主会话，三者共用一个 `server.py`）：三方各自拿到
+**自己的** `会话身份`、**自己的** `已绑定应用`（计算器 / 访达 / 未绑定）与**自己的** `binding_id`，
+互不顶替、零 `CONTROLLER_BUSY`（目标不同）；其中一方还能看到「另一个会话 X 正在操作访达（剩余 55 秒）」
+的提示 —— 状态可见、动作受限。
+
+**降级路径**：读不到 `caller.json`（老版本 host 半区、别的 DSH 版本、文件过期）时，服务器把所有调用
+放进一个 `shared` 桶 —— 也就是**旧行为**，并在 `screen_info` 里如实写「会话身份: 未启用」。降级而不是坏掉。
+
+**另外两道纵深防线**（不依赖身份，仍然保留）：
+
+1. **绑定令牌 `binding_id`**：`get_app` / `get_ax_state` 回显，动作类工具（含 `sequence`、
+   `release_lease`）带错即 `ERROR[BINDING_CHANGED]`、一次都不下发；带旧令牌**观察**会明确警告
+   「这棵树不是你要观察的应用」；没带令牌 = 放行但附一句自我纠正提醒。
+2. **索引纪元**（`ax_bridge.bump_index_epoch`）：每次换绑把索引分配起点抬高十万位，两个绑定期发出的
+   索引**数值上永不重叠** —— 即使身份管线整个失效（老 host 半区），旧索引也只会 `ELEMENT_UNAVAILABLE`，
+   不可能命中新应用树里的同号元素。
+
+**不做 per-agent 子进程（A 方案）**：DSH 的官方形态是有的，第一方先例就是 `dsh-acp` 的
+`agentCtx.plugin(McpClient, config)`（`dsh-acp/lib/index.js:216-219`），生命周期挂在 agent scope fiber 上，
+agent 作用域还允许复用同名 `serverName`（`dsh-mcp-client/lib/index.js:768-772` + README:128）。
+但**第三方插件拿不到那个模块**：本插件在隔离 headless 里实测 `import('@deepseek-ai/dsh-mcp-client')`
+→ `ERR_MODULE_NOT_FOUND`（app 的副本在 `app.asar/dsh/node_modules`，不在插件的解析链上；profile 的
+`node_modules/@deepseek-ai/` 只有 `cosmokit`/`schemastery`）。要走 A 就得在 host 半区自建 MCP 客户端
+（JSON-RPC + `ctx.tools.register` 的工具/结果映射 + 接 `attachments`/`llm.resolveModelInfo` 的图片投影），
+那是一次压在「工具能不能注册出来」生死线上的架构级改动 —— **明确不做**。
 
 **全局 vs 隔离的边界**（刻意如此，改任何一条都要先想清楚）：
 
-| 状态 | 现在 | 为什么 |
+| 状态 | 现状 | 为什么 |
 |---|---|---|
-| 绑定 / 绑定令牌 / 索引纪元 | 单进程内共享（令牌 + 纪元把它变成可检测、可拦住） | 这是本次缺陷所在；真正的隔离要 per-agent 进程 |
-| 租约 | 文件仲裁，持有者是**进程** | 跨进程（多个 DSH 实例、独立会话）是对的；同一实例内的多会话要等 per-agent 进程才分得开 |
-| 急停 `kill` 文件 | **刻意全局** | 用户按一次 ⏹，就要停掉这台电脑上所有的电脑操作，而不是某一个会话 |
-| 预览浮窗 / `/_computer-use/*` 路由 | **刻意全局**（host 半区挂在根 ctx，只有一份） | 它是用户侧唯一的观察面与恢复入口，多会话共用一份画面才是对的 |
-| 物理输入互斥锁 | 单进程内 | 与绑定同源；per-agent 之后需要改成跨进程文件锁，否则两个会话可能同时注入输入 |
+| 绑定 / 令牌 | **按会话**（有身份时）；无身份退回一个共享桶 | 有身份就严格隔离，没身份就降级 —— 不留半吊子 |
+| 租约 | **按会话**（`leases/<会话>.json`；无身份时 `<pid>.json`，与旧版同名） | 同一实例内也能 `CONTROLLER_BUSY`；跨进程/跨实例本来就能仲裁 |
+| AX 观察器 / 索引 | **按 pid 共享**（索引是「哪个应用的第几号元素」，跨会话看同一个应用本就该共享） | 这是资源缓存而不是会话状态；换绑时的撞号风险由索引纪元兜住 |
+| 急停 `kill` 文件 | **刻意全局** | 用户按一次 ⏹ 就要停掉这台电脑上的一切电脑操作，而不是某一个会话 |
+| 预览浮窗 / `/_computer-use/*` | **刻意全局**（host 半区只有一份） | 唯一的观察面与恢复入口，多会话共用一份画面才是对的 |
+| 物理输入互斥锁 | 单进程内（`threading.RLock`） | 只有一个服务器进程，所以它天然跨会话生效；调用者闸门再加一层「一次一个调用」 |
+| 请求串行 | host 半区闸门（同一次一个 computer-use 调用；150 秒保险丝） | 身份文件必须与调用一一对应；顺带保住「同一块鼠标键盘」这条物理约束 |
 
 **没有合并的旧名**（§3.7 本身标着「可选，需评估兼容性」）：`click` 与 `click_element` 保持两个工具 ——
 合成一个「index 或 x/y 二选一」的 `click` 会让 `x`/`y` 从 required 变成可选，把「忘了传坐标」这类错误
@@ -363,7 +369,7 @@ scripts/            install.sh / build_capture.sh（用户向）与 *-smoke、li
   急停三档（环境变量 / 急停文件 / `stop`+`resume`，其中文件档与 `resume` 各起一个独立进程验证跨进程一致）；
   租约仲裁（`CONTROLLER_BUSY` / `force` 抢占 / 死进程回收 / 被抢后拦动作 / 释放）；
   以及动作层契约（每个动作都是 `ActionResult`、签名覆盖工具声明、`on_unchanged` 真的会停、
-  `step_timeout_ms` 真的压住 `_settle`）。wire check 共 118 条断言（`npm run verify` 合计 143 条），其中一组是**一个服务器进程 + 两个逻辑调用者**的多会话拓扑（生产缺陷的忠实复现：从服务器这一侧看，宿主机就是一条 stdio 连接上交替来的两组调用）。
+  `step_timeout_ms` 真的压住 `_settle`）。wire check 共 131 条断言（`npm run verify` 合计 161 条），其中两组是**一个服务器进程 + 多个逻辑调用者/会话**的多会话拓扑（生产缺陷的忠实复现：从服务器这一侧看，宿主机就是一条 stdio 连接上交替来的两组调用）。
   浮窗上那个 ⏹ 的接线（`NSButton.target/action` → `onStop_` → 写/清标志）用一次性脚本验证：
   它要起 NSApplication，所以不进 `npm run check`（会弹窗），只在改动浮窗时手动跑一次。
 - **发布包只装会被加载的东西**（`files` 白名单，`npm pack --dry-run` 可审）：`lib/index.js`
@@ -551,4 +557,19 @@ Python 图章」），Dock 上就不会再攒 Python 火箭。这个目录是生
   `Assertion failed: (did_initialize)` 打死（现在起流前先取一次 `CGMainDisplayID` /
   `CGWindowListCopyWindowInfo`）；选目标窗要按**面积**挑，CGWindowList 的前后顺序里
   66x20 的标签选择器小窗会插在文档窗前面
+- **多会话隔离依赖 host 半区**：身份来自 `tools/pre-execute` 的 `exec.agent.id`。老版本 host 半区
+  （没有这段代码）、或别的 DSH 版本里事件不派发时，服务器退回「一个共享桶」= 旧行为，并在
+  `screen_info` 里如实写「会话身份: 未启用」；此时只剩绑定令牌 + 索引纪元两道纵深防线
+- **调用者闸门是刻意的串行点**：同一时刻只有一个 computer-use 调用在跑（identity 文件必须与调用
+  一一对应），同一实例里的多会话会排队而不是并行抢鼠标；`post-execute` 万一没回来，150 秒保险丝
+  强制放行（宁可放行下一个，也不把所有人的电脑操作卡死）
+- **AX 观察器按 pid 共享**：这是资源缓存而不是会话状态（索引就是「哪个应用的第几号元素」）。
+  生命周期已修：`forget()` 以前是死代码 —— 观察器建了就一直在 `_OBSERVERS` 里，每个节点攥着一份
+  retain 过的 `AXUIElementRef` 加整树快照，一轮任务开关十几个应用就是真泄漏。现在
+  `observer_for()` 会顺手回收已退出应用的观察器，`_resolve_app` 发现绑定应用退出时立刻回收，
+  急停 `stop()` 里 `forget_all()`，并提供显式 `forget_observer(pid)`（wire check 有断言）
+- **索引纪元的前提写在 `bump_index_epoch()` 的 docstring 里**，调用方必须保证：① 单线程调用
+  （MCP 分发是单线程的，`_bind_app` 是唯一调用点）；② **只在换绑时调、每次换绑都必须调**；
+  ③ 同一观察器在一个纪元内新增节点数 < `_EPOCH_STEP`（每次观察上限 2000，留了 50 倍余量）。
+  漏调一次，两个绑定期的索引空间就会重叠 —— 那正是这个机制要防的事
 - 模型侧建议：GUI 任务用擅长视觉定位的模型 + 适度推理等级，步骤会少很多

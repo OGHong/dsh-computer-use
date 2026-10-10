@@ -9,7 +9,7 @@ process.env.DSH_CUA_STREAM = '0' // 不去 spawn 真的抓屏进程，专测路�
 // 隔离的状态目录：真实 dsh 会话正在往 /tmp/dsh-computer-use/latest.jpg 以 10 次/秒
 // 写帧，共用一个目录会让「有没有开录屏」这类断言被它搅浑，也会把垃圾写进现场。
 process.env.DSH_CUA_DIR = `/tmp/dsh-cua-smoke.${process.pid}`
-const { mkdirSync, writeFileSync, existsSync, rmSync } = await import('node:fs')
+const { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } = await import('node:fs')
 const DIR = process.env.DSH_CUA_DIR
 mkdirSync(DIR, { recursive: true })
 /**
@@ -205,7 +205,9 @@ mod.apply(ctx2)
 const pipeline = effects.find((entry) => String(entry.label).includes('frame pipeline'))
 if (!pipeline) throw new Error('帧管线没有登记 ctx.effect —— 定时器会随热替换泄漏')
 if (typeof pipeline.dispose !== 'function') throw new Error('帧管线的 effect 没有返回 disposer')
-if (effects.length !== 2) throw new Error(`期望 2 个受管副作用（帧管线 + 路由），实际 ${effects.length}`)
+if (effects.length !== 3) throw new Error(`期望 3 个受管副作用（帧管线 + 调用者身份 + 路由），实际 ${effects.length}`)
+if (!effects.some((e) => String(e.label).includes('caller identity')))
+	throw new Error('调用者身份管线没有登记 ctx.effect —— 热替换会留下野监听器')
 
 const held = { status: 0, ended: false }
 const heldRes = {
@@ -237,4 +239,88 @@ for (const entry of effects.slice(2)) {
 }
 console.log('✓ 热替换后再挂一次正常（旧 disposer 已释放，新实例照常工作）')
 
+// --- 调用者身份管线（多会话隔离 B 方案：闸门 + caller.json） ---------------------
+// spike 实测：tools/pre-execute 拿得到 exec.agent.id（= 会话 id），且钩子是**闸门**
+// （pre 里 sleep 2 秒，工具真的等满 2 秒才跑）。这里把那条契约固化成断言。
+const listeners = new Map()
+const effects3 = []
+const ctx3 = {
+	effect: (fn, label) => { const d = fn(); effects3.push({ label, dispose: d }); return d },
+	connection: { admit: () => ({}) },
+	webServer: { register: () => () => {} },
+	get: () => undefined,
+	on: (event, fn, options) => {
+		const arr = listeners.get(event) ?? []
+		arr.push({ fn, options })
+		listeners.set(event, arr)
+		return () => {
+			const now = listeners.get(event) ?? []
+			listeners.set(event, now.filter((e) => e.fn !== fn))
+		}
+	}
+}
+mod.apply(ctx3)
+const pre = listeners.get('tools/pre-execute')?.[0]?.fn
+const post = listeners.get('tools/post-execute')?.[0]?.fn
+if (typeof pre !== 'function' || typeof post !== 'function')
+	throw new Error('调用者身份管线没有登记 pre/post-execute 监听器')
+if (listeners.get('tools/pre-execute')[0].options?.prepend !== true)
+	throw new Error('pre-execute 没有 prepend —— 别人的钩子可能先改掉 exec')
+
+const callerFile = `${DIR}/caller.json`
+const readCaller = () => JSON.parse(readFileSync(callerFile, 'utf8'))
+const nextOk = async () => ({ kind: 'allow' })
+
+const execA = { name: 'mcp__computer-use__screen_info', callId: 'c1', agent: { id: 'session-AAA' }, arguments: {} }
+await pre(execA, nextOk)
+const rec1 = readCaller()
+if (rec1.agent !== 'session-AAA' || rec1.tool !== 'mcp__computer-use__screen_info' || typeof rec1.at !== 'number')
+	throw new Error(`caller.json 内容不对：${JSON.stringify(rec1)}`)
+console.log(`✓ pre-execute 写 caller.json：agent=${rec1.agent} tool=${rec1.tool.split('__').pop()} seq=${rec1.seq}`)
+
+// 闸门：第二个调用必须等第一个的 post-execute
+const execB = { name: 'mcp__computer-use__list_apps', callId: 'c2', agent: { id: 'session-BBB' }, arguments: {} }
+let bRan = false
+const pB = pre(execB, async () => { bRan = true; return { kind: 'allow' } })
+await sleep(60)
+if (bRan) throw new Error('闸门没生效：第二个 computer-use 调用在第一个 post 之前就派发了')
+await post(execA, { isError: false }, async () => ({ kind: 'accept' }))
+await pB
+if (!bRan) throw new Error('post-execute 之后没有交棒，后面的调用被永久卡住')
+const rec2 = readCaller()
+if (rec2.agent !== 'session-BBB' || rec2.seq <= rec1.seq)
+	throw new Error(`交棒后 caller.json 没更新：${JSON.stringify(rec2)}`)
+console.log(`✓ 闸门串行化：A 的 post 之前 B 不派发；交棒后 caller.json → ${rec2.agent}`)
+
+// 迟到的 post（序号已过期）不能把闸门错误地交给别人
+const execC = { name: 'mcp__computer-use__click', callId: 'c3', agent: { id: 'session-CCC' }, arguments: {} }
+let cRan = false
+const pC = pre(execC, async () => { cRan = true; return { kind: 'allow' } })
+await sleep(40)
+await post(execA, { isError: false }, async () => ({ kind: 'accept' })) // 迟到的 A 的 post
+await sleep(60)
+if (cRan) throw new Error('过期的 post-execute 把闸门错误地放行了（重复释放没被挡住）')
+await post(execB, { isError: false }, async () => ({ kind: 'accept' }))
+await pC
+if (!cRan) throw new Error('真正持有者的 post 没能交棒')
+await post(execC, { isError: false }, async () => ({ kind: 'accept' }))
+console.log('✓ 重复/迟到的 post-execute 被幂等挡住（不会误放行）')
+
+// 别的工具（内置 read）不写文件、不占用闸门
+const callerBefore = readFileSync(callerFile, 'utf8')
+let readNext = false
+await pre({ name: 'read', callId: 'c4', agent: { id: 'session-AAA' } }, async () => { readNext = true; return { kind: 'allow' } })
+if (!readNext) throw new Error('非 computer-use 工具被闸门拦住了')
+if (readFileSync(callerFile, 'utf8') !== callerBefore) throw new Error('非 computer-use 工具改写了 caller.json')
+console.log('✓ 只有 mcp__computer-use__* 走闸门（内置工具不受影响、不写文件）')
+
+// 卸载：监听器要一起收回
+const identity = effects3.find((e) => String(e.label).includes('caller identity'))
+if (!identity || typeof identity.dispose !== 'function') throw new Error('调用者身份管线没有 disposer')
+identity.dispose()
+if ((listeners.get('tools/pre-execute') ?? []).length !== 0 || (listeners.get('tools/post-execute') ?? []).length !== 0)
+	throw new Error('卸载后监听器还挂着 —— 热替换会叠加钩子')
+console.log('✓ 卸载收回调用者身份管线（监听器清空）')
+
 rmSync(DIR, { recursive: true, force: true })
+

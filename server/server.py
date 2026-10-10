@@ -85,6 +85,10 @@ class _LazyModule:
             self._mod = importlib.import_module(self._name)
         return getattr(self._mod, item)
 
+    def loaded(self) -> bool:
+        """这个重模块已经被用过吗（清理类操作据此决定要不要付加载成本）。"""
+        return self._mod is not None
+
 
 ax = _LazyModule("ax_bridge")
 cg = _LazyModule("cg_input")
@@ -1773,7 +1777,8 @@ def screen_info() -> str:
         "会话隔离: ⚠️ 这个服务器进程被本 DSH 实例的**所有会话**共用，绑定/租约/观察器都是进程内共享状态；"
         "动作带 binding_id 才能在绑定被别人改掉时被拦住（ERROR[BINDING_CHANGED]）。",
         killswitch.state_line(),
-        f"控制器租约: {lease.describe()}",
+        f"控制器租约: {lease.describe(_holder())}",
+        _session_line(),
     ]
     return "\n".join(lines)
 
@@ -1791,7 +1796,12 @@ def stop(reason: str = "") -> str:
     why = killswitch.stop(reason)
     if why.startswith("ERROR["):
         return why
-    lease.release()
+    lease.release_all()
+    if ax.loaded():          # 只在 AX 层已经加载时才做清理，别为一个清理动作把重模块拉起来
+        try:
+            ax.forget_all()
+        except Exception:
+            pass
     return (
         f"已进入只读（急停）：{why}。动作类工具从此返回 ERROR[KILLED]，观察类工具照常可用；"
         "恢复用 resume()，或在预览浮窗上按 ▶。"
@@ -1819,10 +1829,11 @@ def release_lease(binding_id: str = "") -> str:
             "这份租约现在属于另一个会话，不能由你释放（否则会把它的控制器夺走）。"
             "如果你确实要操作这台电脑，先 get_app 重新绑定；确实要交还控制权就直接 release_lease() 不带令牌。"
         )
-    held = lease.mine()
-    if lease.release():
-        return f"已释放控制器租约 {held.get('lease_id')}（目标 {held.get('target_name') or held.get('target_pid')}）。"
-    return "当前没有持有控制器租约（可能是因为从没 get_app 绑定过应用）。"
+    held = lease.mine(_holder())
+    if lease.release(_holder()):
+        return (f"已释放控制器租约 {held.get('lease_id')}（目标 {held.get('target_name') or held.get('target_pid')}，"
+                f"持有者 {held.get('holder')}）。")
+    return "当前会话没有持有控制器租约（可能是因为没 get_app 绑定过应用）。"
 
 # ---------------------------------------------------------------------------
 # 无障碍（AX）元素级操作 —— 优先路径：后台可读可点，不占用用户的鼠标
@@ -1832,7 +1843,7 @@ _bound_app: dict | None = None
 
 # 动作层的租约检查要知道「这一下打在哪个 pid 上」；动作层不该知道 _bound_app 在哪儿，
 # 所以由这里把读法注册进去（依赖倒置）。
-action_layer.bind_lease_target(lambda: int(_bound_app["pid"]) if _bound_app else None)
+action_layer.bind_lease_target(lambda: (int(_bound_app["pid"]) if _bound_app else None, _holder()))
 
 
 # ---- 绑定令牌（任务书 §4.2）---------------------------------------------------
@@ -1867,6 +1878,77 @@ def _bind_app(info: dict) -> str:
         "at": time.time(),
     })
     return _binding["id"]
+
+
+# ---- 会话身份（任务书《多会话隔离》B 方案）-------------------------------------
+# 服务器是宿主级单例，一个 DSH 实例里的所有会话共用它。协议层（stdio MCP）**不带任何身份**，
+# 所以身份由 host 半区在 `tools/pre-execute` 里写进 `caller.json`（它拿得到 `exec.agent.id`），
+# 服务器在每次 tools/call 的开头读一次，然后把「这次调用所属会话」的状态装进下面的模块级视图：
+#
+#   * 绑定（`_bound_app`）与绑定令牌（`_binding`）按会话分份；
+#   * 租约（`lease`）按会话分份（持有者键 = 会话 id）；
+#   * 观察器仍然按 pid 共享 —— 索引本身是「哪个应用的第几号元素」，跨会话看同一个应用时本来就该共享。
+#
+# 读不到身份（老 host 半区 / 文件过期 / 别人的 DSH 版本）→ 全部落到 `_SHARED` 一个桶里，
+# 也就是**旧行为**：降级，而不是坏掉。
+_CALLER_FILE = SHOT_DIR / "caller.json"
+_SHARED = "shared"
+_SESSIONS: dict = {}
+_CALL_KEY = [_SHARED]
+_ACTIVE: list = [None]
+
+
+def _caller_key() -> str:
+    """这次调用来自哪个会话（读 host 半区写的 `caller.json`；读不到就退回共享桶）。"""
+    try:
+        rec = json.loads(_CALLER_FILE.read_text(encoding="utf-8"))
+        fresh = time.time() * 1000 - int(rec.get("at") or 0) <= 30000
+        if fresh and rec.get("agent"):
+            return str(rec["agent"])
+    except (OSError, ValueError, TypeError):
+        pass
+    return _SHARED
+
+
+def _new_session() -> dict:
+    return {"bound_app": None,
+            "binding": {"id": "", "pid": None, "name": "", "seq": 0, "at": 0.0}}
+
+
+def enter_call(name: str = "") -> None:
+    """tools/call 之前：把这次调用所属会话的状态装进当前视图（模块级全局就是「当前会话」）。"""
+    global _bound_app, _binding
+    key = _caller_key()
+    st = _SESSIONS.setdefault(key, _new_session())
+    _CALL_KEY[0] = key
+    _ACTIVE[0] = st
+    _bound_app = st["bound_app"]
+    _binding = st["binding"]          # 必须是同一个 dict 对象：_bind_app 是就地 update
+
+
+def leave_call(name: str = "") -> None:
+    """tools/call 之后：把当前视图存回所属会话，供它下一次调用接着用。"""
+    st = _ACTIVE[0]
+    if st is None:
+        return
+    st["bound_app"] = _bound_app
+    st["binding"] = _binding
+    _ACTIVE[0] = None
+    _CALL_KEY[0] = _SHARED
+
+
+def _holder() -> str:
+    """当前调用的租约持有者键（会话身份；没有身份时是共享桶）。"""
+    return _CALL_KEY[0]
+
+
+def _session_line() -> str:
+    """screen_info 用的一行：身份从哪来、现在分了几个会话的状态。"""
+    if set(_SESSIONS) <= {_SHARED}:
+        return ("会话身份: 未启用（host 半区没有写 caller.json）—— 绑定与租约是**进程级共享**的，"
+                "多会话会互相覆盖；升级插件的 host 半区即可启用按会话隔离。")
+    return (f"会话身份: 已启用（每个会话一份绑定/租约，共 {len(_SESSIONS)} 个会话有状态）；"
+            f"当前调用属于 {_holder()}。")
 
 
 def _binding_app() -> str:
@@ -1929,7 +2011,11 @@ def _resolve_app(spec: str = "", bind: bool = True) -> dict:
             os.kill(int(_bound_app["pid"]), 0)  # 还在就不必重新解析（running_apps 要问 LaunchServices）
             return _bound_app
         except OSError:
-            pass      # 应用没了：下面退回前台应用（并换令牌）
+            # 应用没了：立刻回收它的观察器（那些节点攥着 AX 元素引用），再退回前台应用（并换令牌）
+            try:
+                ax.forget_observer(int(_bound_app["pid"]))
+            except Exception:
+                pass
     info = ax.find_app("front")
     if bind:
         _bind_app(info)
@@ -1980,7 +2066,7 @@ def _do_get_app(app: str = "", force: bool = False, focus: bool = False) -> Acti
     finally:
         app_el.dispose()
     _publish_focus(pid=info["pid"])
-    granted = lease.acquire(int(info["pid"]), target_name=info["name"], force=bool(force))
+    granted = lease.acquire(int(info["pid"]), target_name=info["name"], force=bool(force), holder=_holder())
     detail = {"app": info, "windows": wins, "lease": granted, "binding_id": binding}
     if focus:
         detail["activated"] = _activate_pid(info["pid"])
@@ -2011,9 +2097,10 @@ def _render_get_app(r: ActionResult) -> str:
     ]
     body = "\n".join(wlines) or "  (无可见窗口)"
     if not r.ok:
-        return (f"{head}，但动作能力被仲裁拦住：{r.message}\n窗口：\n{body}\n"
-                f"{r.detail.get('hint', '')}{_binding_line()}{tail(r)}")
-    out = f"{head}\n窗口：\n{body}\n{lease.describe()}"
+        # 类型化错误码必须原样露出来（模型要按 ERROR[CONTROLLER_BUSY] 分支，而不是读散文猜）
+        return f"{head}\n窗口：\n{body}\n{render_error(r)}{_binding_line()}"
+    # 租约行必须按**当前会话**取（不带 holder 会读成进程级那一份，刚申请到的租约看起来像没有）
+    out = f"{head}\n窗口：\n{body}\n{lease.describe(_holder())}"
     if lease_rec.get("warning"):
         out += f" ⚠️ {lease_rec['warning']}"
     if d.get("activated") is False:
@@ -2480,7 +2567,7 @@ def _render_paste(r: ActionResult) -> str:
 def _do_focus_app(app: str = "", binding_id: str = "") -> ActionResult:
     """把目标应用带到前台并聚焦（之后键盘/坐标输入就会落在它上面）。"""
     info = _resolve_app(app)
-    granted = lease.acquire(int(info["pid"]), target_name=info["name"])
+    granted = lease.acquire(int(info["pid"]), target_name=info["name"], holder=_holder())
     if not granted.get("ok"):
         return _with_detail(_lease_block(f"{info['name']}（pid={info['pid']}）", granted),
                             {"app": info, "lease": granted})
@@ -2509,7 +2596,7 @@ def _render_focus_app(r: ActionResult) -> str:
 def _do_focus_window(index: int, binding_id: str = "") -> ActionResult:
     """把绑定应用的指定窗口提到最前并聚焦（内部 = 激活应用 + AXRaise 该窗口）。"""
     info = _resolve_app()
-    granted = lease.acquire(int(info["pid"]), target_name=info["name"])
+    granted = lease.acquire(int(info["pid"]), target_name=info["name"], holder=_holder())
     if not granted.get("ok"):
         return _with_detail(_lease_block(f"{info['name']}（pid={info['pid']}）", granted),
                             {"app": info, "lease": granted})
@@ -2619,6 +2706,12 @@ def open_permission_settings() -> str:
         timeout=15,
     )
     return "已打开 系统设置 → 隐私与安全性 → 辅助功能。请把 DeepSeek Harness 添加进去并打开开关。屏幕录制权限在「屏幕录制」一节。"
+
+
+# 协议层每收一次 tools/call，就装上/卸下「这次调用属于哪个会话」的视图。
+action_layer.bind_lease_holder(_holder)
+mcp.before_call = enter_call
+mcp.after_call = leave_call
 
 
 if __name__ == "__main__":

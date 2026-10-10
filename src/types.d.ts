@@ -77,4 +77,23 @@ export interface HostContext {
   webServer: WebServerService
   get(key: 'agents'): AgentsService | undefined
   get(key: string): unknown
+  /**
+   * 监听一个 Cordis 事件。这里只用到工具调度的三个事件：
+   * `tools/pre-execute` / `tools/post-execute` 是 **waterfall**（监听器必须 `return next()`），
+   * `tools/result` 是 emit。`exec.agent.id` 就是**会话 id** —— 服务器靠它区分调用者。
+   */
+  on?(event: string, listener: (...args: any[]) => any, options?: { prepend?: boolean }): unknown
+  /** 动态注入：依赖的服务齐了才执行回调（预览路由用它，tui/headless 里就没有这段）。 */
+  inject?(deps: string[], callback: (scope: HostContext) => unknown): unknown
+}
+
+/** 一次工具执行（只声明本插件用到的字段；见 dsh-tools 的 ToolExecution）。 */
+export interface ToolExecution {
+  readonly name?: string
+  readonly callId?: string
+  readonly arguments?: Record<string, unknown>
+  readonly agent?: { readonly id?: string }
+  readonly parent?: { readonly callId?: string }
+  /** 我们自己在 pre-execute 里记下的闸门序号（用于幂等释放）。 */
+  __cuaGateSeq?: number
 }

@@ -229,6 +229,11 @@ class Server:
     def __init__(self, name: str, version: str = "", instructions: str = ""):
         self.name, self.version, self.instructions = name, version, instructions
         self.tools: dict[str, dict] = {}
+        #: 每次 tools/call 之前/之后的钩子（`fn(name)`）。server.py 用它把「这次调用属于哪个会话」
+        #: 装上/卸下当前视图 —— 身份由 host 半区写在 caller.json 里，协议层只负责在对的时机问一次。
+        #: 钩子里抛异常绝不允许影响工具调用本身。
+        self.before_call = None
+        self.after_call = None
 
     def tool(self, **_kw):
         """与 FastMCP 同名的装饰器：`@mcp.tool()`。"""
@@ -290,6 +295,11 @@ class Server:
                     _end_call()
                     sys.stderr.write("computer-use: 请求在开始前就被取消，未执行\n")
                     return None
+                if self.before_call is not None:
+                    try:
+                        self.before_call(tool["name"])
+                    except Exception as e:  # noqa: BLE001
+                        sys.stderr.write(f"{self.name}: before_call 钩子出错（忽略）：{e}\n")
                 try:
                     result = tool["fn"](**args)
                 except Cancelled:
@@ -305,6 +315,11 @@ class Server:
                     text = str(e) if code else f"ERROR[INTERNAL]: {type(e).__name__}: {e}"
                     return self._reply(msg_id, {"content": [{"type": "text", "text": text}], "isError": True})
                 finally:
+                    if self.after_call is not None:
+                        try:
+                            self.after_call(tool["name"])
+                        except Exception as e:  # noqa: BLE001
+                            sys.stderr.write(f"{self.name}: after_call 钩子出错（忽略）：{e}\n")
                     _end_call()
                 if isinstance(result, Image):
                     return self._reply(msg_id, {"content": [result.content()], "isError": False})

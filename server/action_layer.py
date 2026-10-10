@@ -90,14 +90,22 @@ def was_sent() -> bool:
 
 
 #: 「这次动作打在哪个 pid 上」—— 由 server.py 注册（动作层不该知道绑定应用在哪儿）。
-#: 返回 None = 没有绑定应用（纯坐标路径）→ 租约不介入。
-_lease_target = lambda: None  # noqa: E731
+#: 返回 ``(pid | None, holder)``：pid=None = 没有绑定应用（纯坐标路径）→ 租约不介入；
+#: holder = 调用方身份（DSH 里是会话 id），租约按它分份仲裁。
+_lease_target = lambda: (None, "")  # noqa: E731
+#: 急停时要交还的是**当前会话**那一份租约，不是整个进程的。
+_lease_holder = lambda: ""  # noqa: E731
 
 
 def bind_lease_target(fn) -> None:
     """server.py 在模块加载时把 `_bound_app` 的读法注册进来（依赖倒置，避免环形 import）。"""
     global _lease_target  # noqa: PLW0603
     _lease_target = fn
+
+
+def bind_lease_holder(fn) -> None:
+    global _lease_holder  # noqa: PLW0603
+    _lease_holder = fn
 
 
 #: 「调用方带的绑定令牌还对得上吗」—— 同样由 server.py 注册（任务书 §4.2）。
@@ -164,7 +172,8 @@ def action(risk: bool = True):
             try:
                 if risk:
                     killswitch.guard()
-                    blocked = lease.guard(_lease_target())
+                    _target_pid, _target_holder = _lease_target()
+                    blocked = lease.guard(_target_pid, _target_holder)
                     if blocked:
                         return _finish(
                             ActionResult(
@@ -192,7 +201,7 @@ def action(risk: bool = True):
                     if note:
                         result.detail["notice"] = f"{result.detail.get('notice', '')} {note}".strip()
             except killswitch.Killed as e:
-                lease.release()   # 急停即交出控制器：别的会话/用户可以立刻接管
+                lease.release(_lease_holder())   # 急停即交出控制器：别的会话/用户可以立刻接管
                 return _finish(
                     ActionResult(ok=False, error="KILLED", message=str(e), possibly_sent=False,
                                  detail={"hint": KILL_HINT}),

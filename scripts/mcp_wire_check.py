@@ -109,6 +109,9 @@ def main() -> int:
     info = recv_call(send, recv, "screen_info", {})
     check("tools/call 文本结果", info["content"][0]["type"] == "text" and "主屏逻辑尺寸" in info["content"][0]["text"],
           info["content"][0]["text"][:28].replace("\n", " "))
+    check("没有 caller.json 时如实报告「会话身份未启用」（降级到旧的共享行为，而不是假装隔离）",
+          "会话身份: 未启用" in info["content"][0]["text"],
+          [ln for ln in info["content"][0]["text"].splitlines() if "会话身份" in ln][0][:70])
     shot = recv_call(send, recv, "screenshot", {})
     blocks = shot.get("content", [])
     texts = "".join(b.get("text", "") for b in blocks if b.get("type") == "text")
@@ -274,6 +277,74 @@ def main() -> int:
         line = next((ln for ln in info_txt.splitlines() if "已绑定应用" in ln), "")
         check("如实报告：绑定仍是进程内共享的（screen_info 里点名了这条限制）",
               "所有会话" in info_txt and f"binding_id={b_b}" in line, line[:90])
+
+    # --- 会话级隔离（任务书 §5.1 四项，协议级复现：一个服务器进程 + 两个会话身份） ------
+    # host 半区在 tools/pre-execute 里把 exec.agent.id 写进 caller.json（host-smoke 已验），
+    # 服务器每次 tools/call 读它。这里直接扮演那个文件，验的就是服务器侧的行为。
+    caller_file = CHECK_DIR / "caller.json"
+
+    def as_session(agent: str) -> None:
+        tmp = caller_file.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps({"agent": agent, "tool": "probe", "seq": 1, "at": int(time.time() * 1000)}),
+                       encoding="utf-8")
+        os.replace(tmp, caller_file)
+
+    apps2 = [ln for ln in call_text("list_apps", {})[0].splitlines() if " pid: " in ln]
+    pids2 = [_re.search(r"pid: (\d+)", ln).group(1) for ln in apps2]
+    if len(pids2) < 2:
+        skip("会话级隔离（§5.1）", f"当前只有 {len(pids2)} 个有界面的应用，需要两个")
+    else:
+        as_session("session-AAA")
+        a_txt, _ = call_text("get_app", {"app": pids2[0]})
+        b_a2 = binding_of(a_txt)
+        call_text("get_ax_state", {"full": True})
+        as_session("session-BBB")
+        b_txt2, _ = call_text("get_app", {"app": pids2[1]})
+        b_b2 = binding_of(b_txt2)
+        call_text("get_ax_state", {"full": True})
+        # §5.1-1 并发绑定隔离：A 再观察，拿到的必须还是 A 那个应用的树
+        as_session("session-AAA")
+        a_again, _ = call_text("get_ax_state", {"full": True})
+        check("§5.1 并发绑定隔离：B 绑定别的应用之后，A 拿到的仍是**自己**那个应用的树",
+              f"pid={pids2[0]}" in a_again and b_a2 in a_again and f"pid={pids2[1]}" not in a_again,
+              [ln for ln in a_again.splitlines() if "binding_id" in ln][0][:90] if "binding_id" in a_again else a_again[:80])
+        as_session("session-AAA")
+        a_info, _ = call_text("screen_info", {})
+        check("§5.1 每个会话各有一份绑定（screen_info 里能看出 A 没被 B 改掉）",
+              ("会话身份: 已启用" in a_info) and (f"binding_id={b_a2}" in a_info),
+              [ln for ln in a_info.splitlines() if "已绑定应用" in ln][0][:80])
+        as_session("session-AAA")
+        a_get, _ = call_text("get_app", {"app": pids2[0]})
+        b_a2 = binding_of(a_get)   # 重新绑定会换令牌：后续断言用最新那枚
+        check("§5.1 get_app 当场就能看到**自己**那份租约（不是进程级那份，也不是空）",
+              "控制器租约 l-session-AAA" in a_get, [ln for ln in a_get.splitlines() if "租约" in ln][0][:80])
+        # §5.1-2 跨会话 CONTROLLER_BUSY：B 去抢 A 正持有的应用
+        as_session("session-BBB")
+        busy, _ = call_text("get_app", {"app": pids2[0]})
+        check("§5.1 跨会话 CONTROLLER_BUSY，且持有者信息里能分辨是哪个会话",
+              "CONTROLLER_BUSY" in busy and "session-AAA" in busy, busy[:110])
+        # §5.1-4 release_lease 只释放自己那份
+        as_session("session-AAA")
+        rel, _ = call_text("release_lease", {"binding_id": b_a2})
+        left = sorted(q.name for q in (CHECK_DIR / "leases").glob("*.json"))
+        check("§5.1 A 的 release_lease 只释放自己那份（B 的租约文件还在）",
+              "已释放" in rel and "session-AAA" in rel and "session-BBB.json" in left,
+              f"{rel[:60]} | 剩余租约 {left}")
+        # §5.1-3 动作不误伤：A 用自己的旧索引，解析的仍是 A 的应用
+        as_session("session-AAA")
+        mine, _ = call_text("get_ax_state", {"full": True})
+        idx = _re.findall(r"\[(\d+)\]", mine)
+        as_session("session-BBB")
+        call_text("get_ax_state", {"full": True})          # B 也观察（索引落在 B 的纪元里）
+        as_session("session-AAA")
+        safe, _ = call_text("select_text", {"index": int(idx[0]) if idx else 0, "text": "\u0000不存在的串"})
+        check("§5.1 动作不误伤：A 的索引在 A 自己的绑定下解析（不受 B 的绑定影响）",
+              "ERROR[" in safe and "BINDING_CHANGED" not in safe, safe[:90])
+        caller_file.unlink(missing_ok=True)
+        shared_again, _ = call_text("screen_info", {})
+        check("删掉 caller.json 之后这次调用回落到共享桶（身份没了就退回旧行为，不炸）",
+              "当前调用属于 shared" in shared_again,
+              [ln for ln in shared_again.splitlines() if "会话身份" in ln][0][:80])
 
     # 主连接到这里就功成身退：下面的生命周期检查各用独立进程（Dock 图章要新进程，
     # 断连要能关掉一条连接的 stdin）。**之后不要再往 send/recv 上加检查**——它们会读到
@@ -638,6 +709,36 @@ def main() -> int:
     finally:
         server_mod._bound_app = saved_app
         server_mod._binding.update(saved_bind)
+
+    # --- 观察器生命周期：退出应用留下的观察器必须被回收（forget() 一度是死代码 → 真泄漏） ---
+    live_pids = [a["pid"] for a in server_mod.ax.running_apps()]
+    if not live_pids:
+        skip("观察器回收", "当前没有有界面的应用")
+    else:
+        pid = live_pids[0]
+        obs = server_mod.ax.observer_for(pid)
+        obs.observe(full=True)
+        first = next(iter(obs.nodes.values()), None)
+        check("观察器建起来之后确实持有 AX 元素引用（这正是泄漏的东西）",
+              first is not None and first.el.p != 0, f"nodes={len(obs.nodes)}")
+        check("显式回收：节点引用被释放、注册表不再留着它",
+              server_mod.ax.forget_observer(pid) is True
+              and pid not in server_mod.ax._OBSERVERS
+              and (first is None or first.el.p == 0),
+              f"el.p={first.el.p if first else '-'}")
+        check("回收是幂等的（再回收一次返回 False，不炸）", server_mod.ax.forget_observer(pid) is False)
+
+        # 死进程：不用等谁显式回收，下一次取观察器时顺手扫掉
+        victim = subprocess.Popen(["sleep", "30"], stdout=subprocess.DEVNULL)
+        dead_pid = victim.pid
+        server_mod.ax.observer_for(dead_pid)
+        victim.kill()
+        victim.wait(timeout=5)
+        server_mod.ax.observer_for(live_pids[0])          # 触发一次 prune
+        check("已退出的应用留下的观察器会被自动回收（不用等下一次观察）",
+              dead_pid not in server_mod.ax._OBSERVERS, f"残留 pid={dead_pid}")
+        check("活着的应用不受影响（回收只针对已经退出的）",
+              live_pids[0] in server_mod.ax._OBSERVERS)
 
     # 落点保护：读不到窗口列表时必须 fail-closed，而不是静默放行
     saved_bound = server_mod._bound_app

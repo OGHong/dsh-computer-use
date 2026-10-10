@@ -26,6 +26,7 @@ from __future__ import annotations
 import atexit
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -37,9 +38,22 @@ RENEW_MIN_S = 1.0
 _DIR = "leases"
 _LOG = "leases.log"
 
-#: 本进程持有的租约（内存真相；写盘的副本供别的会话判断）
-_mine: dict = {}
-_last_renew = [0.0]
+#: 本进程持有的租约，**按持有者键分开**（内存真相；写盘的副本供别的会话判断）。
+#: 持有者键 = 调用方身份（DSH 里是 session id）。同一个服务器进程服务多个会话时，
+#: 它们各自持有一份 —— 这正是「同一个 DSH 实例内也能仲裁」的前提（任务书多会话一节）。
+_mine: dict[str, dict] = {}
+_last_renew: dict[str, float] = {}
+
+
+def holder_key(value: str = "") -> str:
+    """把调用方身份收敛成一个安全的文件名/比较键；空 = 退回本进程 pid。
+
+    旧版本只有「持有者 = 进程」这一种粒度，所以没有身份的调用方保持老语义（等价于以前的行为）。
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return str(os.getpid())      # 旧语义：持有者就是进程（文件名也保持 <pid>.json 不变）
+    return re.sub(r"[^A-Za-z0-9._-]", "_", raw)[:64]
 
 
 def _base() -> Path:
@@ -99,22 +113,27 @@ def _read_file(path: Path) -> dict:
     return raw if isinstance(raw, dict) else {}
 
 
-def _scan() -> list[dict]:
-    """所有**活着**的租约；顺手回收死进程/过期留下的文件。"""
+def _scan(me: str = "") -> list[dict]:
+    """所有租约（含同一个进程里**别的会话**那些）；顺手回收死进程/过期留下的文件。
+
+    `me` = 我自己的持有者键：只有它被跳过。同一个进程里别的会话（同一个 pid、不同键）
+    必须算「别人」—— 否则同一个 DSH 实例内的多会话永远拿不到 CONTROLLER_BUSY。
+    """
     out: list[dict] = []
     try:
         files = sorted(_dir().glob("*.json"))
     except OSError:
         return out
     now = time.time()
+    mine_key = holder_key(me)
     for path in files:
         rec = _read_file(path)
         holder = rec.get("holder_pid")
         if not rec or not holder:
             _drop(path, "文件损坏")
             continue
-        if int(holder) == os.getpid():
-            out.append(rec)          # 自己的：由 _mine 代表，这里只是别被当成别人
+        if holder_key(rec.get("holder_key") or str(holder)) == mine_key:
+            out.append(rec)          # 我自己的：由 _mine 代表，这里只是别被当成别人
             continue
         if not _alive(holder):
             _drop(path, f"持有者 pid {holder} 已不在（崩溃/强杀），自动回收")
@@ -134,12 +153,13 @@ def _drop(path: Path, why: str) -> None:
         pass
 
 
-def _path_for(holder_pid: int) -> Path:
-    return _dir() / f"{int(holder_pid)}.json"
+def _path_for(holder: str, holder_pid: int | None = None) -> Path:
+    """租约文件：**一个持有者一份**（键 = 会话身份；没有身份就是 <pid>.json，与旧版同名）。"""
+    return _dir() / f"{holder_key(holder)}.json"
 
 
 def _write(rec: dict) -> None:
-    path = _path_for(rec["holder_pid"])
+    path = _path_for(rec.get("holder_key") or str(rec["holder_pid"]), rec["holder_pid"])
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".json.tmp")
@@ -149,30 +169,40 @@ def _write(rec: dict) -> None:
         _log(f"租约写盘失败 {path}：{e}")
 
 
-def mine() -> dict:
-    """本进程当前持有的租约（空 dict = 没持有）。"""
-    return dict(_mine)
+def _label(holder: str) -> str:
+    """租约里给人看的持有者名字：有会话身份就写它（CONTROLLER_BUSY 要能分辨是谁）。"""
+    if not holder:
+        return holder_label()
+    short = holder if len(holder) <= 26 else holder[:26] + "…"
+    return f"会话 {short}"
+
+
+def mine(holder: str = "") -> dict:
+    """这个持有者当前持有的租约（空 dict = 没持有）。"""
+    return dict(_mine.get(holder_key(holder)) or {})
 
 
 def _remaining(rec: dict) -> float:
     return max(0.0, float(rec.get("renewed_at") or 0) + float(rec.get("ttl") or ttl()) - time.time())
 
 
-def acquire(target_pid: int, target_name: str = "", force: bool = False) -> dict:
-    """申请（或续期）``target_pid`` 的租约。
+def acquire(target_pid: int, target_name: str = "", force: bool = False, holder: str = "") -> dict:
+    """申请（或续期）``target_pid`` 的租约，持有者是 ``holder``。
 
+    ``holder`` = 调用方身份（DSH 里是会话 id）；留空 = 本进程（旧语义：持有者就是进程）。
     返回 ``{"ok", "lease_id", "remaining_s", "warning", "blocked_by"}``：
     ``ok=False`` 且带 ``blocked_by`` = 别人正持有同一目标且活着（CONTROLLER_BUSY）。
-    目标不同但别人也在操作时仍然放行，只带一句 warning —— 用户可能确实要两个会话各干各的，
-    但要让他知道「前台会被抢」这件事。
+    目标不同但别人也在操作时仍然放行，只带一句 warning。
     """
+    key = holder_key(holder)
+    label = _label(holder)
     now = time.time()
     ttl_s = ttl()
     target = int(target_pid)
     blocked: dict | None = None
     warning = ""
-    for rec in _scan():
-        if int(rec.get("holder_pid") or 0) == os.getpid():
+    for rec in _scan(key):
+        if holder_key(rec.get("holder_key") or str(rec.get("holder_pid"))) == key:
             continue
         same = int(rec.get("target_pid") or 0) == target
         left = _remaining(rec)
@@ -182,11 +212,12 @@ def acquire(target_pid: int, target_name: str = "", force: bool = False) -> dict
         if same and force:
             _log(
                 f"抢占：{rec.get('lease_id')}（{rec.get('holder')}，目标 {rec.get('target_name') or rec.get('target_pid')}）"
-                f" → {holder_label()}（目标 {target_name or target}）"
+                f" → {label}（目标 {target_name or target}）"
             )
             # 抢占必须**真的**把对方的记录收掉：留着它，被抢的一方下次 guard() 仍然看得见
             # 自己那份、抢占方也会被自己刚抢来的文件挡住 —— 两边一起卡死。
-            _drop(_path_for(int(rec.get("holder_pid"))), f"被 {holder_label()} 抢占")
+            _drop(_path_for(rec.get("holder_key") or str(rec.get("holder_pid")), rec.get("holder_pid")),
+                  f"被 {label} 抢占")
         elif not same:
             warning = (
                 f"另一个会话（{rec.get('holder') or rec.get('holder_pid')}）正在操作 "
@@ -201,89 +232,105 @@ def acquire(target_pid: int, target_name: str = "", force: bool = False) -> dict
             "remaining_s": _remaining(blocked),
             "warning": warning,
         }
-    if not _mine or int(_mine.get("target_pid") or 0) != target:
-        _mine.clear()
-        _mine.update(
-            {
-                "lease_id": f"l-{os.getpid()}-{int(now * 1000)}",
-                "holder_pid": os.getpid(),
-                "holder": holder_label(),
-                "target_pid": target,
-                "target_name": target_name or "",
-                "acquired_at": now,
-                "renewed_at": now,
-                "ttl": ttl_s,
-            }
-        )
+    cur = _mine.get(key)
+    if not cur or int(cur.get("target_pid") or 0) != target:
+        _mine[key] = {
+            "lease_id": f"l-{key}-{int(now * 1000)}",
+            "holder_key": key,
+            "holder_pid": os.getpid(),
+            "holder": label,
+            "target_pid": target,
+            "target_name": target_name or "",
+            "acquired_at": now,
+            "renewed_at": now,
+            "ttl": ttl_s,
+        }
     else:
-        _mine["renewed_at"] = now
-        _mine["ttl"] = ttl_s
-        _mine["target_name"] = target_name or _mine.get("target_name") or ""
-    _write(_mine)
-    _last_renew[0] = now
+        cur["renewed_at"] = now
+        cur["ttl"] = ttl_s
+        cur["target_name"] = target_name or cur.get("target_name") or ""
+    rec = _mine[key]
+    _write(rec)
+    _last_renew[key] = now
     return {
         "ok": True,
-        "lease_id": _mine["lease_id"],
-        "remaining_s": _remaining(_mine),
+        "lease_id": rec["lease_id"],
+        "remaining_s": _remaining(rec),
         "warning": warning,
         "blocked_by": None,
     }
 
 
-def renew() -> None:
+def renew(holder: str = "") -> None:
     """续期（写盘节流；内存里的 renewed_at 每次都更新，写盘至少间隔 RENEW_MIN_S）。"""
-    if not _mine:
+    key = holder_key(holder)
+    rec = _mine.get(key)
+    if not rec:
         return
     now = time.time()
-    _mine["renewed_at"] = now
-    if now - _last_renew[0] >= RENEW_MIN_S:
-        _write(_mine)
-        _last_renew[0] = now
+    rec["renewed_at"] = now
+    if now - _last_renew.get(key, 0.0) >= RENEW_MIN_S:
+        _write(rec)
+        _last_renew[key] = now
 
 
-def guard(target_pid: int | None = None) -> dict | None:
+def guard(target_pid: int | None = None, holder: str = "") -> dict | None:
     """动作前的租约检查：``None`` = 放行；否则是给模型的阻塞信息（CONTROLLER_BUSY）。
 
     自己的租约被别人 ``force`` 抢走后，这里必须挡住 —— 否则「抢占」只是写了一条日志。
     """
-    if not _mine:
+    key = holder_key(holder)
+    rec_mine = _mine.get(key)
+    if not rec_mine:
         return None                       # 没申请过租约（纯坐标路径）→ 不介入
-    if target_pid is not None and int(_mine.get("target_pid") or 0) != int(target_pid):
+    if target_pid is not None and int(rec_mine.get("target_pid") or 0) != int(target_pid):
         return None                       # 换了目标应用：get_app 会重新申请
-    for rec in _scan():
-        if int(rec.get("holder_pid") or 0) == os.getpid():
+    for rec in _scan(key):
+        if holder_key(rec.get("holder_key") or str(rec.get("holder_pid"))) == key:
             continue
-        if int(rec.get("target_pid") or 0) == int(_mine.get("target_pid") or 0):
+        if int(rec.get("target_pid") or 0) == int(rec_mine.get("target_pid") or 0):
             return {
                 "ok": False,
                 "error": "CONTROLLER_BUSY",
                 "blocked_by": rec,
                 "remaining_s": _remaining(rec),
             }
-    renew()
+    renew(holder)
     return None
 
 
-def release() -> bool:
-    """显式释放（幂等）。返回 True = 确实释放了一份。"""
-    if not _mine:
+def release(holder: str = "") -> bool:
+    """释放这个持有者的租约（幂等）。返回 True = 确实释放了一份。"""
+    key = holder_key(holder)
+    rec = _mine.pop(key, None)
+    _last_renew.pop(key, None)
+    if not rec:
         return False
     try:
-        _path_for(os.getpid()).unlink(missing_ok=True)
+        _path_for(key, rec.get("holder_pid")).unlink(missing_ok=True)
     except OSError:
         pass
-    _mine.clear()
-    _last_renew[0] = 0.0
     return True
 
 
-def describe() -> str:
+def release_all() -> int:
+    """本进程持有的全部租约一起放掉（急停 / 进程退出）。返回释放的份数。"""
+    count = 0
+    for key in list(_mine):
+        if release(key):
+            count += 1
+    return count
+
+
+def describe(holder: str = "") -> str:
     """给模型看的一行租约状态（get_app / CONTROLLER_BUSY 都复用它）。"""
-    if not _mine:
+    rec = _mine.get(holder_key(holder))
+    if not rec:
         return "当前没有持有控制器租约（动作不会被仲裁拦住）"
     return (
-        f"控制器租约 {_mine.get('lease_id')}（目标 {_mine.get('target_name') or _mine.get('target_pid')}，"
-        f"剩余 {_remaining(_mine):.0f} 秒，每次动作自动续期）"
+        f"控制器租约 {rec.get('lease_id')}（持有者 {rec.get('holder')}，"
+        f"目标 {rec.get('target_name') or rec.get('target_pid')}，"
+        f"剩余 {_remaining(rec):.0f} 秒，每次动作自动续期）"
     )
 
 
@@ -298,4 +345,4 @@ def describe_holder(rec: dict) -> str:
     )
 
 
-atexit.register(release)
+atexit.register(release_all)

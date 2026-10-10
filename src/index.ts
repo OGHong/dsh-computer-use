@@ -39,13 +39,22 @@ import { execFile, spawn } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { fileURLToPath } from 'node:url'
-import type { HostContext } from './types.js'
+import type { HostContext, ToolExecution } from './types.js'
 
 /** Cordis plugin name. */
 export const name = 'computer-use'
 
-/** Services this half needs to mount its route. */
-export const inject = ['connection', 'webServer']
+/**
+ * 静态依赖 = **空**。
+ *
+ * 以前这里写的是 `['connection', 'webServer']`，于是整个 host 半区在 tui / headless 这类没有
+ * web 服务的 profile 里**永远不会挂载** —— 而「这次调用属于哪个会话」的调用者身份管线正是在
+ * 这一半区里（`mountCallerIdentity`）。结果是：没有 web 服务的 profile 里多会话缺陷静默复发。
+ *
+ * 现在拆开：身份管线只要有 `ctx.on` 就挂（任何 profile 都成立），预览路由走
+ * `ctx.inject(['connection', 'webServer'], …)` 动态注入，服务不在就只是没有预览路由。
+ */
+export const inject: string[] = []
 
 /**
  * The MCP server's scratch directory (latest.jpg / status.txt live here).
@@ -192,6 +201,136 @@ function emitFrame(frame: Buffer): void {
  * 由 `apply()` 里的 `ctx.effect` 按 2 秒一跑，随插件一起卸载 —— 放在模块顶层
  * 会让热替换后的旧定时器永远活着。
  */
+/**
+ * 调用者身份（任务书《computer-use 多会话隔离》B 方案）。
+ *
+ * 这个 MCP 服务器是**宿主级单例**：一个 DSH 实例里所有会话共用它，而 stdio MCP 协议
+ * **不带任何身份字段**（dsh-mcp-client 只发 `{name, arguments}`，参数还是冻结的）。
+ * 唯一知道「这次调用属于哪个会话」的地方是 host 半区 —— `tools/pre-execute` 的
+ * `exec.agent.id` 就是会话 id（spike 实测：`session-78c637…`）。
+ *
+ * 所以这一半区做两件事：
+ *
+ *  1. **闸门**：computer-use 的调用一次只放一个过去，直到它的 `post-execute` 回来。
+ *     没有它，两个会话同时调用时 `caller.json` 是谁后写的就归谁 —— 服务器会把 A 的动作
+ *     算到 B 头上，缺陷原样复现。串行化顺带保住了「同一块鼠标键盘」这条物理约束。
+ *  2. **写 `caller.json`**：`{agent, tool, seq, at}`，原子替换。MCP 服务器在每次
+ *     `tools/call` 开头读它，把绑定与租约按会话分份。
+ *
+ * 读不到这个文件（老版本 host 半区、闸门超时后的残留）时，服务器退回「一个共享桶」，
+ * 也就是旧行为 —— 降级而不是坏掉。
+ */
+const CALLER = `${BASE}/caller.json`
+/** 只管这个命名空间下的工具；别的工具（内置 read/bash…）一概不碰，也不写文件。 */
+const CU_TOOL_PREFIX = 'mcp__computer-use__'
+/**
+ * 闸门保险丝：`toolCallTimeoutMs` 是 120 秒，取它 +30 秒。真被触发说明 `post-execute`
+ * 没回来（极少见），此时**宁可放行下一个**也不能把所有人的电脑操作卡死。
+ */
+const GATE_FUSE_MS = 150_000
+/** 闸门当前被谁持有（序号）与等待队列；0 = 空闲。 */
+let gateHolder = 0
+let gateTimer: ReturnType<typeof setTimeout> | null = null
+const gateQueue: Array<() => void> = []
+let callerSeq = 0
+
+function armFuse(): void {
+  if (gateTimer) clearTimeout(gateTimer)
+  gateTimer = setTimeout(() => {
+    gateTimer = null
+    process.stderr.write('dsh-computer-use: 调用者闸门超时（post-execute 未回），强制放行下一个\n')
+    openGate(gateHolder)
+  }, GATE_FUSE_MS)
+  // 定时器不参与事件循环存活判定：宿主退出时不该被它拖住
+  ;(gateTimer as unknown as { unref?: () => void }).unref?.()
+}
+
+/** 等闸门。拿到之后必须保证最终 `openGate(seq)`（post-execute / result / 保险丝）。 */
+async function awaitGate(): Promise<void> {
+  if (gateHolder === 0) return
+  await new Promise<void>((resolve) => gateQueue.push(resolve))
+}
+
+/** 交棒/放行。`seq` 对不上 = 重复释放（post-execute 与 result 都会到），忽略即可。 */
+function openGate(seq: number): void {
+  if (seq !== 0 && seq !== gateHolder) return
+  if (gateTimer) {
+    clearTimeout(gateTimer)
+    gateTimer = null
+  }
+  const next = gateQueue.shift()
+  if (next !== undefined) {
+    next() // 交棒：gateHolder 由下一个调用在自己的 pre 里改写
+    return
+  }
+  gateHolder = 0
+}
+
+/** 原子写 `caller.json`；返回本次的闸门序号。 */
+function publishCaller(agent: string, tool: string): number {
+  callerSeq += 1
+  gateHolder = callerSeq
+  armFuse()
+  const payload = { agent, tool, seq: callerSeq, at: Date.now() }
+  try {
+    mkdirSync(BASE, { recursive: true })
+    writeFileSync(`${CALLER}.tmp`, JSON.stringify(payload))
+    renameSync(`${CALLER}.tmp`, CALLER)
+  } catch (error) {
+    process.stderr.write(`dsh-computer-use: 写 caller.json 失败 (${String(error)})\n`)
+  }
+  return callerSeq
+}
+
+/**
+ * 挂上调用者身份管线，返回 disposer。
+ *
+ * `pre-execute` / `post-execute` 是 **waterfall**：监听器必须 `return next()`，否则工具调用会
+ * 挂住 —— 这也正是闸门能生效的原因（spike 实测：pre 里 sleep 2 秒，工具真的等满 2 秒才跑）。
+ */
+function mountCallerIdentity(ctx: HostContext): () => void {
+  const offPre = ctx.on?.(
+    'tools/pre-execute',
+    async (exec: ToolExecution, next: () => Promise<unknown>) => {
+      if (!String(exec?.name ?? '').startsWith(CU_TOOL_PREFIX)) return next()
+      await awaitGate()
+      const seq = publishCaller(String(exec?.agent?.id ?? '') || 'unknown', String(exec.name))
+      exec.__cuaGateSeq = seq
+      return next()
+    },
+    { prepend: true }
+  )
+  const offPost = ctx.on?.(
+    'tools/post-execute',
+    async (exec: ToolExecution, _result: unknown, next: () => Promise<unknown>) => {
+      if (String(exec?.name ?? '').startsWith(CU_TOOL_PREFIX)) openGate(exec.__cuaGateSeq ?? 0)
+      return next()
+    },
+    { prepend: true }
+  )
+  const offResult = ctx.on?.('tools/result', (exec: ToolExecution) => {
+    // 兜底：正常路径 post-execute 已经放行过（openGate 幂等），这里只兜「post 没到」的异常收尾
+    if (String(exec?.name ?? '').startsWith(CU_TOOL_PREFIX)) openGate(exec.__cuaGateSeq ?? 0)
+  })
+  return () => {
+    for (const off of [offPre, offPost, offResult]) {
+      if (typeof off === 'function') {
+        try {
+          ;(off as () => void)()
+        } catch {
+          /* 卸载路径不抛 */
+        }
+      }
+    }
+    if (gateTimer) {
+      clearTimeout(gateTimer)
+      gateTimer = null
+    }
+    gateHolder = 0
+    gateQueue.length = 0
+  }
+}
+
 /** 动作时间戳（status.txt 的 mtime），读不到就是 0（未知）。 */
 function activityMtime(): number {
   try {
@@ -435,10 +574,19 @@ export function apply(ctx: HostContext): void {
     process.stderr.write(`dsh-computer-use: could not start the frame pipeline (${String(error)})\n`)
   }
 
+  // 调用者身份管线：**第一件事**。它只需要 ctx.on，任何 profile 都能挂上；
+  // 少了它，同一个 DSH 实例里的多个会话就会共用一份绑定与租约（多会话隔离缺陷）。
   try {
-    ctx.effect(
-      () =>
-        ctx.webServer.register({
+    ctx.effect(() => mountCallerIdentity(ctx), 'computer-use: caller identity')
+  } catch (error) {
+    process.stderr.write(`dsh-computer-use: could not mount the caller-identity pipeline (${String(error)})\n`)
+  }
+
+  try {
+    const mountRoutes = (scope: HostContext) =>
+      scope.effect(
+        () =>
+          scope.webServer.register({
           kind: 'prefix',
           path: CHANNEL,
           handler: (req: IncomingMessage, res: ServerResponse) => {
@@ -592,9 +740,17 @@ export function apply(ctx: HostContext): void {
             res.writeHead(404, { 'content-type': 'text/plain' })
             res.end('unknown endpoint')
           }
-        }),
-      'computer-use: preview routes'
-    )
+          }),
+        'computer-use: preview routes'
+      )
+    if (typeof ctx.inject === 'function') {
+      // 服务齐了才挂路由；tui / headless 里 connection / webServer 不存在，跳过即可。
+      ctx.inject(['connection', 'webServer'], (scope: HostContext) => {
+        mountRoutes(scope)
+      })
+    } else {
+      mountRoutes(ctx) // 老的/测试用的 ctx 没有 inject：按老样子直接挂
+    }
   } catch (error) {
     process.stderr.write(`dsh-computer-use: could not mount preview routes (${String(error)})\n`)
   }
