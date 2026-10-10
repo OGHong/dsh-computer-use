@@ -42,6 +42,7 @@ if __name__ == "__main__":
 import inspect
 import json
 import re
+import secrets
 import subprocess
 import threading
 import time
@@ -110,6 +111,10 @@ mcp = Server(
         "{\"observe\": {\"diff\": true}} 伪步在中间插一次观察（插过之后元素索引要用新的）。"
         "动作返回 possibly_sent: true 时，**不要重复同一动作** —— 那一步可能已经下发，"
         "先 get_ax_state 观察当前状态，再决定下一步；重复一个可能已生效的点击会造成重复提交。"
+        "**绑定令牌**：get_app 与 get_ax_state 的返回里有一行 binding_id=…；后续动作（含 sequence）"
+        "请把它带上。这个服务器进程被同一 DSH 实例的所有会话共用，别的会话 get_app 会改掉绑定 —— "
+        "带上令牌时你会拿到 ERROR[BINDING_CHANGED]（这时重新 get_app + get_ax_state 再动手），"
+        "不带就只能靠索引碰运气，可能点到别的应用上。"
         "元素路径动作可用 strategy=a11y 强制走无障碍语义（失败即报错，不会偷偷碰用户鼠标），"
         "坐标动作可用 strategy=event 强制合成事件。"
         "多个会话/子代理同时操作同一台电脑时，get_app 会返回 ERROR[CONTROLLER_BUSY]；"
@@ -848,7 +853,17 @@ def _install(spec) -> None:
     mcp.tool()(tool)
 
 
+#: 带 `binding_id` 的动作统一补这句（工具描述里不重复写 12 遍）
+_BINDING_CLAUSE = (
+    "\nbinding_id=最近一次 get_ax_state / get_app 回显的绑定令牌（可选）。服务器被同一 DSH 实例的多个会话"
+    "共享，带上它可以在绑定被别人改过时挡住「照旧索引点到别的应用上」——对不上会返回 ERROR[BINDING_CHANGED]，"
+    "提示你重新 get_app + get_ax_state。"
+)
+
+
 def _register(name: str, fn, render, description: str, risk: bool = True, read_only: bool = False):
+    if "binding_id" in inspect.signature(fn).parameters:
+        description += _BINDING_CLAUSE
     spec = ActionSpec(name=name, fn=fn, render=render, description=description, risk=risk, read_only=read_only)
     _ACTIONS[name] = spec
     _install(spec)
@@ -1042,7 +1057,7 @@ def _press_at_point(px: int, py: int, where: str) -> ActionResult:
 # ---------- 坐标路径的动作 ----------
 
 @action(risk=True)
-def _do_click(x: int, y: int, button: str = "left", double: bool = False, force: bool = False, strategy: str = "auto") -> ActionResult:
+def _do_click(x: int, y: int, button: str = "left", double: bool = False, force: bool = False, strategy: str = "auto", binding_id: str = "") -> ActionResult:
     """截图坐标点击：auto/event = 真实指针点击；a11y = 这一点的元素 + AXPress（不降级）。"""
     st = _strategy(strategy)
     px, py = _to_screen_point(int(x), int(y))
@@ -1082,7 +1097,7 @@ def _do_click(x: int, y: int, button: str = "left", double: bool = False, force:
 
 
 @action(risk=True)
-def _do_scroll(x: int, y: int, direction: str = "down", amount: int = 5, strategy: str = "auto") -> ActionResult:
+def _do_scroll(x: int, y: int, direction: str = "down", amount: int = 5, strategy: str = "auto", binding_id: str = "") -> ActionResult:
     """滚动：auto/event 走滚轮事件；a11y 走元素的 AXScroll* 语义动作（没有就报错）。"""
     st = _strategy(strategy)
     px, py = _to_screen_point(int(x), int(y))
@@ -1163,7 +1178,7 @@ def _scroll_semantic(px: int, py: int, direction: str, clicks: int) -> ActionRes
 
 
 @action(risk=True)
-def _do_type_text(text: str, strategy: str = "auto") -> ActionResult:
+def _do_type_text(text: str, strategy: str = "auto", binding_id: str = "") -> ActionResult:
     """剪贴板粘贴输入；strategy 决定注入通道（a11y 不降级到合成事件）。"""
     st = _strategy(strategy)
     body = str(text)
@@ -1192,7 +1207,7 @@ def _do_type_text(text: str, strategy: str = "auto") -> ActionResult:
 
 
 @action(risk=True)
-def _do_press_key(key: str, hold_seconds: float = 0, window: str = "", strategy: str = "auto") -> ActionResult:
+def _do_press_key(key: str, hold_seconds: float = 0, window: str = "", strategy: str = "auto", binding_id: str = "") -> ActionResult:
     """按键；按键前先对齐窗口归属（见 _aim_keys）。"""
     st = _strategy(strategy)
     parts = [KEY_ALIASES.get(p.strip().lower(), p.strip().lower()) for p in str(key).split("+") if p.strip()]
@@ -1239,7 +1254,7 @@ def _do_press_key(key: str, hold_seconds: float = 0, window: str = "", strategy:
 
 
 @action(risk=True)
-def _do_drag(from_x: int, from_y: int, to_x: int, to_y: int, duration: float = 0.5, force: bool = False, strategy: str = "auto") -> ActionResult:
+def _do_drag(from_x: int, from_y: int, to_x: int, to_y: int, duration: float = 0.5, force: bool = False, strategy: str = "auto", binding_id: str = "") -> ActionResult:
     """拖拽（只有合成事件路径；a11y 无对应语义动作，明确报错而不是装作成功）。"""
     st = _strategy(strategy)
     if st == "a11y":
@@ -1513,7 +1528,7 @@ _register(
 # ---------- MCP 工具定义 ----------
 
 @mcp.tool()
-def sequence(steps: list, on_unchanged: str = "continue", step_timeout_ms: int = 5000, sequence_timeout_ms: int = 20000):
+def sequence(steps: list, on_unchanged: str = "continue", step_timeout_ms: int = 5000, sequence_timeout_ms: int = 20000, binding_id: str = ""):
     """一轮多步：按顺序执行一串动作（元素路径与坐标路径都可以），一次调用跑完整条链路。
 
     steps 每项形如：
@@ -1536,8 +1551,14 @@ def sequence(steps: list, on_unchanged: str = "continue", step_timeout_ms: int =
     6. 每步返回真实 settle_ms；wait 步走「界面稳定即返回」，固定秒数只是上限。
     7. step_timeout_ms 是**每步的等待预算**（settle 不会超过它），sequence_timeout_ms 是总预算
        （在步与步之间检查）—— 单个已下发的 CGEvent/AX 调用不可抢占，所以这是预算而不是强杀线。
-    8. 一次结果最多一张栅格图：只有最后一个 observe / screenshot 步骤会附图。"""
-    return _run_sequence(steps, on_unchanged, step_timeout_ms, sequence_timeout_ms)
+    8. 一次结果最多一张栅格图：只有最后一个 observe / screenshot 步骤会附图。
+    9. binding_id=最近一次 get_ax_state / get_app 回显的绑定令牌（可选）：整批动作都打在同一个绑定上，
+       带上它可以在别的会话改过绑定之后**在第一步之前**就拒绝整批，而不是照着旧索引点到别的应用上。"""
+    stale = action_layer.check_binding(binding_id)
+    if stale:
+        return (f"ERROR[BINDING_CHANGED]: {stale}\n"
+                "整批没有执行（0 步），先重新 get_app + get_ax_state，再用新索引重发。")
+    return _run_sequence(steps, on_unchanged, step_timeout_ms, sequence_timeout_ms, binding_id)
 
 
 #: 当前步骤的等待预算（毫秒）；`_settle` 读它。None = 用默认 ACTION_DELAY。
@@ -1600,7 +1621,7 @@ def _required_args(fn) -> list:
     return [p.name for p in inspect.signature(fn).parameters.values() if p.default is inspect.Parameter.empty]
 
 
-def _run_sequence(steps, on_unchanged, step_timeout_ms, sequence_timeout_ms):
+def _run_sequence(steps, on_unchanged, step_timeout_ms, sequence_timeout_ms, binding_id: str = ""):
     if not isinstance(steps, list) or not steps:
         return (
             'ERROR[INVALID_ARGUMENT]: steps 必须是非空数组，每项形如 {"tool": "click_element", "args": {"index": 42}} '
@@ -1657,6 +1678,10 @@ def _run_sequence(steps, on_unchanged, step_timeout_ms, sequence_timeout_ms):
             break
         if name == "wait" and "until_stable" not in args:
             args = {**args, "until_stable": True}   # 批处理里的 wait 走稳定判定，不固定睡满
+        # 顶层令牌下发给每一步：整批就是一个逻辑动作，它的绑定是同一份。顺带让每一步自己
+        # 也过一遍绑定校验（纵深防御），并免掉每步那句「本次没带 binding_id」的噪声。
+        if binding_id and "binding_id" not in args and "binding_id" in inspect.signature(spec.fn).parameters:
+            args = {**args, "binding_id": binding_id}
         missing = [k for k in _required_args(spec.fn) if k not in args]
         if missing:
             res = ActionResult(ok=False, error="INVALID_ARGUMENT", possibly_sent=False,
@@ -1744,7 +1769,9 @@ def screen_info() -> str:
         ),
         f"辅助功能权限（点击/键盘必需）: {'已授予' if ax_ok else '未授予（系统设置→隐私与安全性→辅助功能→添加 DeepSeek Harness）' if ax_ok is False else '未知'}",
         f"屏幕录制权限（截屏必需）: {'已授予' if scr else '未授予（系统设置→隐私与安全性→屏幕录制→添加 DeepSeek Harness）' if scr is False else '未知'}",
-        f"已绑定应用: {bound}",
+        f"已绑定应用: {bound}" + (f"（binding_id={_binding['id']}）" if _binding["id"] else ""),
+        "会话隔离: ⚠️ 这个服务器进程被本 DSH 实例的**所有会话**共用，绑定/租约/观察器都是进程内共享状态；"
+        "动作带 binding_id 才能在绑定被别人改掉时被拦住（ERROR[BINDING_CHANGED]）。",
         killswitch.state_line(),
         f"控制器租约: {lease.describe()}",
     ]
@@ -1781,16 +1808,21 @@ def resume() -> str:
 
 
 @mcp.tool()
-def release_lease() -> str:
-    """显式释放控制器租约（「谁在操作这台电脑」的那份仲裁）。进程退出会自动释放。"""
+def release_lease(binding_id: str = "") -> str:
+    """显式释放控制器租约（「谁在操作这台电脑」的那份仲裁）。进程退出会自动释放。
+
+    binding_id=你在 get_app / get_ax_state 里拿到的那枚令牌（可选）：服务器被多个会话共享，
+    带上它就能保证你释放的是**自己那份**租约 —— 对不上会拒绝，而不是把另一个会话的控制器夺走。"""
+    if binding_id and str(binding_id) != _binding["id"]:
+        return (
+            f"ERROR[BINDING_CHANGED]: 你带的是 {binding_id}，当前绑定是 {_binding['id']} {_binding_app()}。"
+            "这份租约现在属于另一个会话，不能由你释放（否则会把它的控制器夺走）。"
+            "如果你确实要操作这台电脑，先 get_app 重新绑定；确实要交还控制权就直接 release_lease() 不带令牌。"
+        )
     held = lease.mine()
     if lease.release():
         return f"已释放控制器租约 {held.get('lease_id')}（目标 {held.get('target_name') or held.get('target_pid')}）。"
     return "当前没有持有控制器租约（可能是因为从没 get_app 绑定过应用）。"
-
-# ---------------------------------------------------------------------------
-# 无障碍（AX）元素级操作 —— 对齐 ZCode computer-use 的高阶能力
-# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # 无障碍（AX）元素级操作 —— 优先路径：后台可读可点，不占用用户的鼠标
@@ -1803,20 +1835,105 @@ _bound_app: dict | None = None
 action_layer.bind_lease_target(lambda: int(_bound_app["pid"]) if _bound_app else None)
 
 
-def _resolve_app(spec: str = "") -> dict:
-    """解析目标应用：显式 spec > 已绑定 > 前台应用。"""
+# ---- 绑定令牌（任务书 §4.2）---------------------------------------------------
+# 这个服务器是**宿主级单例**：一个 DSH 实例里所有会话共用它，所以 `_bound_app` 天生是共享
+# 状态，「会话 A 的动作打到会话 B 绑定的应用上」在结构上是可能的（真实事故，见任务书 §1）。
+# 绑定令牌把这件事从静默变成可检测：
+#   - `get_app`（以及任何改绑定的调用）换一个新令牌；
+#   - 观察类工具把当前令牌回显给模型；
+#   - 动作类工具可以带上它 —— 对不上就**拒绝**（BINDING_CHANGED），而不是照旧索引点到别的应用上。
+# 它**不是**隔离：真正的隔离要「每个 agent 一个服务器进程」，见 README「多会话」一节。
+_binding = {"id": "", "pid": None, "name": "", "seq": 0, "at": 0.0}
+
+
+def _bind_app(info: dict) -> str:
+    """把绑定指向 info 并**换一个新令牌**；返回新令牌。
+
+    同时抬一次索引纪元（`ax_bridge.bump_index_epoch`）：换绑之后，之前发出去的索引在数值上
+    就与新的那棵树不重叠了 —— 会话 A 的旧索引在会话 B 改过绑定之后只会得到 ELEMENT_UNAVAILABLE，
+    而不是在新应用的树里命中同号元素（任务书 §2.4 那个「静默点错应用」）。
+    """
     global _bound_app
+    _bound_app = info
+    try:
+        ax.bump_index_epoch()
+    except Exception:       # AX 层没加载/不可用也不能让绑定本身失败
+        pass
+    _binding["seq"] += 1
+    _binding.update({
+        "id": f"b{_binding['seq']}-{secrets.token_hex(3)}",
+        "pid": int(info["pid"]),
+        "name": info.get("name") or "",
+        "at": time.time(),
+    })
+    return _binding["id"]
+
+
+def _binding_app() -> str:
+    return f"{_binding['name']}（pid={_binding['pid']}）" if _binding["id"] else "（还没绑定过应用）"
+
+
+def _binding_line() -> str:
+    """观察类工具回显的一行：模型要把这个令牌带在后续动作上。"""
+    if not _binding["id"]:
+        return ""
+    return (
+        f"\n🔗 binding_id={_binding['id']}（目标 {_binding_app()}）—— 后续动作请带上它；"
+        "它一变就说明绑定被改过（同一 DSH 实例里的另一个会话 get_app 了），旧索引不能再用了。"
+    )
+
+
+def _check_binding(value) -> str | None:
+    """动作前的绑定校验：对不上返回错误说明（渲染成 ERROR[BINDING_CHANGED]）。
+
+    没带令牌（`""`）= 放行：这是**可选**参数，老会话与纯坐标路径不受影响；带上才有保护。
+    """
+    if value in (None, "", "-1"):
+        return None
+    if str(value) == _binding["id"]:
+        return None
+    return (
+        f"你的 binding_id={value} 已失效：当前绑定是 {_binding['id']} {_binding_app()}。"
+        "这个服务器被同一 DSH 实例的多个会话共享，另一个会话在这期间重新 get_app 了 —— "
+        "你手里的元素索引已经不是那个应用的索引，照旧操作会点到别的应用上。请重新 get_app + get_ax_state 再动手。"
+    )
+
+
+def _binding_note(value) -> str:
+    """没带令牌时的提醒（只在真的绑定过应用、也就是有索引可用时才加，避免无谓噪声）。"""
+    if value not in (None, "", "-1") or not _binding["id"]:
+        return ""
+    return (
+        f"（本次没带 binding_id：当前绑定 {_binding['id']} {_binding_app()}；"
+        "带上它才能在绑定被别的会话改掉时被拦住。）"
+    )
+
+
+action_layer.bind_binding_checker(_check_binding)
+action_layer.bind_binding_note(_binding_note)
+
+
+def _resolve_app(spec: str = "", bind: bool = True) -> dict:
+    """解析目标应用：显式 spec > 已绑定 > 前台应用。
+
+    `bind=False` = 只解析不绑定（`list_windows(app=…)` 这种「按应用过滤」的只读查询）：
+    既不动 `_bound_app`，也不换绑定令牌 —— 过滤不该有副作用。
+    """
     if spec:
         info = ax.find_app(spec)
-        _bound_app = info
+        if bind:
+            _bind_app(info)
         return info
     if _bound_app:
         try:
             os.kill(int(_bound_app["pid"]), 0)  # 还在就不必重新解析（running_apps 要问 LaunchServices）
             return _bound_app
         except OSError:
-            _bound_app = None
-    return ax.find_app("front")
+            pass      # 应用没了：下面退回前台应用（并换令牌）
+    info = ax.find_app("front")
+    if bind:
+        _bind_app(info)
+    return info
 
 
 def _lease_block(what: str, granted: dict) -> ActionResult:
@@ -1854,9 +1971,8 @@ def _do_get_app(app: str = "", force: bool = False, focus: bool = False) -> Acti
     绑定本身是只读的：租约被别人占着时仍然绑定（观察可用），但返回 CONTROLLER_BUSY，
     后续动作会被仲裁拦住 —— 「能看不能动」比「连看都不让看」有用得多。
     """
-    global _bound_app
     info = ax.find_app(app)
-    _bound_app = info
+    binding = _bind_app(info)      # 换绑定令牌：之前的索引与令牌一起作废（任务书 §4.2）
     app_el = ax.Element.for_pid(info["pid"])
     try:
         ax.enable_chromium_accessibility(app_el)  # Electron/Chromium 首次需要强制开启 AX
@@ -1865,7 +1981,7 @@ def _do_get_app(app: str = "", force: bool = False, focus: bool = False) -> Acti
         app_el.dispose()
     _publish_focus(pid=info["pid"])
     granted = lease.acquire(int(info["pid"]), target_name=info["name"], force=bool(force))
-    detail = {"app": info, "windows": wins, "lease": granted}
+    detail = {"app": info, "windows": wins, "lease": granted, "binding_id": binding}
     if focus:
         detail["activated"] = _activate_pid(info["pid"])
     if not granted.get("ok"):
@@ -1895,19 +2011,25 @@ def _render_get_app(r: ActionResult) -> str:
     ]
     body = "\n".join(wlines) or "  (无可见窗口)"
     if not r.ok:
-        return f"{head}，但动作能力被仲裁拦住：{r.message}\n窗口：\n{body}\n{r.detail.get('hint', '')}{tail(r)}"
+        return (f"{head}，但动作能力被仲裁拦住：{r.message}\n窗口：\n{body}\n"
+                f"{r.detail.get('hint', '')}{_binding_line()}{tail(r)}")
     out = f"{head}\n窗口：\n{body}\n{lease.describe()}"
     if lease_rec.get("warning"):
         out += f" ⚠️ {lease_rec['warning']}"
     if d.get("activated") is False:
         out += f"\n⚠️ 已发送激活指令但无法确认 {info.get('name')} 在前台（部分系统限制自动激活）；可手动点一下它的窗口再继续。"
-    return out + "\n现在可以 get_ax_state 观察它的界面元素。"
+    return out + _binding_line() + "\n现在可以 get_ax_state 观察它的界面元素。"
 
 
 @action(risk=False)
 def _do_observe(app: str = "", window: int = -1, full: bool = False, max_nodes: int = 400,
-                screenshot: bool = False) -> ActionResult:
-    """观察界面：元素树（diff / 全量）+ 可选一张截图 —— 一次调用拿两样（§3.7）。"""
+                screenshot: bool = False, binding_id: str = "") -> ActionResult:
+    """观察界面：元素树（diff / 全量）+ 可选一张截图 —— 一次调用拿两样（§3.7）。
+
+    `binding_id` 在这里**不做拦截**（观察是无害的，而且模型正需要看到当前这棵树才能重新对表），
+    但带错了会在结果里醒目地说明「下面这棵树不是你要观察的那个应用」（任务书 §5.1 的精神：
+    宁可啰嗦，也不要让模型以为自己在看计算器、实际看的是别的应用）。
+    """
     info = _resolve_app(app)
     obs = ax.observer_for(info["pid"])
     root = ax.Element.for_pid(info["pid"])
@@ -1930,6 +2052,12 @@ def _do_observe(app: str = "", window: int = -1, full: bool = False, max_nodes: 
     finally:
         root.dispose()
     detail = {"state": state, "app": info, "hints": _hint_codes()}
+    if binding_id and str(binding_id) != _binding["id"]:
+        detail["notice"] = (
+            f"⚠️ 你带的 binding_id={binding_id} 已失效：当前绑定是 {_binding['id']} {_binding_app()}。"
+            "**下面这棵元素树不是你要观察的那个应用**（同一 DSH 实例的另一个会话改过绑定）。"
+            "要操作它请先重新 get_app 绑定，再按本次的 binding_id 重新观察。"
+        )
     if screenshot:
         if _screen_recording_ok() is False:
             detail["notice"] = "⚠️ 屏幕录制权限未授予宿主 App，这次的附图拿不到（元素树是好的）。"
@@ -1947,13 +2075,14 @@ def _render_observe(r: ActionResult) -> object:
     if not r.ok:
         return render_error(r)
     path = r.detail.get("image")
-    return Blocks(str(r.detail.get("state") or "") + tail(r), Image(path=path) if path else None)
+    text = str(r.detail.get("state") or "") + _binding_line() + tail(r)
+    return Blocks(text, Image(path=path) if path else None)
 
 
 @action(risk=False)
-def _do_elements(app: str = "") -> ActionResult:
+def _do_elements(app: str = "", binding_id: str = "") -> ActionResult:
     """全量元素树（= get_ax_state(full=true) 的旧名，保留为别名）。"""
-    return _do_observe(app=app, full=True)
+    return _do_observe(app=app, full=True, binding_id=binding_id)
 
 
 @action(risk=False)
@@ -1981,7 +2110,7 @@ def _render_screenshot(r: ActionResult) -> object:
 
 @action(risk=False)
 def _do_list_windows(app: str = "") -> ActionResult:
-    target = _resolve_app(app) if app else None
+    target = _resolve_app(app, bind=False) if app else None   # 过滤不该有副作用（不改绑定/不换令牌）
     out = []
     for w in ax.window_list():
         name = w["name"] or "(无标题)"
@@ -2006,7 +2135,7 @@ def _render_list_windows(r: ActionResult) -> str:
 
 
 @action(risk=True)
-def _do_click_element(index: int, button: str = "left", double: bool = False, strategy: str = "auto") -> ActionResult:
+def _do_click_element(index: int, button: str = "left", double: bool = False, strategy: str = "auto", binding_id: str = "") -> ActionResult:
     """元素点击：auto = AXPress 优先、坐标兜底；a11y = 只用 AXPress（没有就报错）；event = 强制坐标。"""
     st = _strategy(strategy)
     info = _resolve_app()
@@ -2076,7 +2205,7 @@ def _render_click_element(r: ActionResult) -> str:
 
 
 @action(risk=True)
-def _do_perform_action(index: int, action: str) -> ActionResult:
+def _do_perform_action(index: int, action: str, binding_id: str = "") -> ActionResult:
     """对元素执行无障碍语义动作（AXPress / AXRaise / AXConfirm / AXCancel / AXPick …）。"""
     info = _resolve_app()
     obs = ax.observer_for(info["pid"])
@@ -2103,7 +2232,7 @@ def _render_perform_action(r: ActionResult) -> str:
 
 
 @action(risk=True)
-def _do_set_value(index: int, value: str, strategy: str = "auto") -> ActionResult:
+def _do_set_value(index: int, value: str, strategy: str = "auto", binding_id: str = "") -> ActionResult:
     """直接写元素值（文本框/滑块），绕过剪贴板与键盘。"""
     st = _strategy(strategy)
     if st == "event":
@@ -2144,7 +2273,7 @@ def _render_set_value(r: ActionResult) -> str:
 
 
 @action(risk=True)
-def _do_select_text(index: int, text: str = "", prefix: str = "", suffix: str = "", cursor: str = "") -> ActionResult:
+def _do_select_text(index: int, text: str = "", prefix: str = "", suffix: str = "", cursor: str = "", binding_id: str = "") -> ActionResult:
     """在文本元素里选一段文字或移动光标（读回选区当证据）。"""
     info = _resolve_app()
     obs = ax.observer_for(info["pid"])
@@ -2301,7 +2430,7 @@ def _pb_set_html(html: str, plain: str):
 
 
 @action(risk=True)
-def _do_paste(text: str, format: str = "text", strategy: str = "auto") -> ActionResult:
+def _do_paste(text: str, format: str = "text", strategy: str = "auto", binding_id: str = "") -> ActionResult:
     """把内容放进剪贴板并粘贴到当前聚焦位置（format=html 时写富文本风味）。"""
     st = _strategy(strategy)
     body = str(text)
@@ -2348,7 +2477,7 @@ def _render_paste(r: ActionResult) -> str:
 
 
 @action(risk=True)
-def _do_focus_app(app: str = "") -> ActionResult:
+def _do_focus_app(app: str = "", binding_id: str = "") -> ActionResult:
     """把目标应用带到前台并聚焦（之后键盘/坐标输入就会落在它上面）。"""
     info = _resolve_app(app)
     granted = lease.acquire(int(info["pid"]), target_name=info["name"])
@@ -2372,12 +2501,12 @@ def _render_focus_app(r: ActionResult) -> str:
     if not r.ok:
         return render_error(r)
     if r.detail.get("activated"):
-        return f"{name} 已在前台聚焦。{tail(r)}"
-    return f"已发送激活指令但无法确认 {name} 在前台。{tail(r)}"
+        return f"{name} 已在前台聚焦。{_binding_line()}{tail(r)}"
+    return f"已发送激活指令但无法确认 {name} 在前台。{_binding_line()}{tail(r)}"
 
 
 @action(risk=True)
-def _do_focus_window(index: int) -> ActionResult:
+def _do_focus_window(index: int, binding_id: str = "") -> ActionResult:
     """把绑定应用的指定窗口提到最前并聚焦（内部 = 激活应用 + AXRaise 该窗口）。"""
     info = _resolve_app()
     granted = lease.acquire(int(info["pid"]), target_name=info["name"])
@@ -2418,7 +2547,7 @@ def _render_focus_window(r: ActionResult) -> str:
     d = r.detail
     if not d.get("raised"):
         return f"{d.get('notice', '')}{tail(r)}"
-    return f"已提升窗口[{d['index']}]并聚焦 {d.get('name')}。{d.get('aim', '')}{tail(r)}"
+    return f"已提升窗口[{d['index']}]并聚焦 {d.get('name')}。{d.get('aim', '')}{_binding_line()}{tail(r)}"
 
 
 _register("paste", _do_paste, _render_paste,

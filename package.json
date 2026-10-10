@@ -1,7 +1,7 @@
 {
   "name": "dsh-computer-use",
-  "version": "0.8.0",
-  "description": "让 Agent 看屏幕、动鼠标键盘：内置 computer-use MCP 服务器（截屏/点击/打字/快捷键/滚动/启动应用/带观察的批量动作/急停/控制器租约/shell），以 mcp__computer-use__* 工具出现在会话中",
+  "version": "0.8.1",
+  "description": "让 Agent 看屏幕、动鼠标键盘：内置 computer-use MCP 服务器（截屏/点击/打字/快捷键/滚动/启动应用/带观察的批量动作/急停/控制器租约/绑定令牌/shell），以 mcp__computer-use__* 工具出现在会话中",
   "license": "MIT",
   "type": "module",
   "main": "lib/index.js",

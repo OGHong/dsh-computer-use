@@ -100,6 +100,31 @@ def bind_lease_target(fn) -> None:
     _lease_target = fn
 
 
+#: 「调用方带的绑定令牌还对得上吗」—— 同样由 server.py 注册（任务书 §4.2）。
+#: 传进来的是动作工具的可选参数 `binding_id`；返回错误说明串 = 拒绝这次动作。
+_binding_check = lambda _value: None  # noqa: E731
+
+
+def bind_binding_checker(fn) -> None:
+    """注册绑定校验（依赖倒置）。它必须只读且便宜：每个 risk 动作前都会走一次。"""
+    global _binding_check  # noqa: PLW0603
+    _binding_check = fn
+
+
+def check_binding(value) -> str:
+    """给不走 `@action` 装饰器的入口用（`sequence` 要先整体校验一次）。"""
+    return _binding_check(value) or ""
+
+
+#: 「没带 binding_id」时的一句提醒 —— 同样由 server.py 注册（没有绑定就返回空串，不刷屏）。
+_binding_note = lambda _value: ""  # noqa: E731
+
+
+def bind_binding_note(fn) -> None:
+    global _binding_note  # noqa: PLW0603
+    _binding_note = fn
+
+
 # ---------------------------------------------------------------------------
 # 动作装饰器：异常 → ActionResult；补 settle_ms / possibly_sent
 # ---------------------------------------------------------------------------
@@ -123,9 +148,10 @@ def _finish(result: object, started: float) -> ActionResult:
 def action(risk: bool = True):
     """把一个 ``_do_*`` 变成「永远返回 ActionResult」的动作层函数。
 
-    ``risk=True`` 的动作在入口依次查：急停 → 控制器租约。两者都在**一次点击发出去之前**
-    返回类型化错误（``KILLED`` / ``CONTROLLER_BUSY``），所以「急停期间一次都不会点下去」和
-    「租约被别人拿着时不会互相踩」都是结构上成立的，不靠各工具自觉。
+    ``risk=True`` 的动作在入口依次查：急停 → 控制器租约 → 绑定令牌。三者都在**一次点击发出去
+    之前**返回类型化错误（``KILLED`` / ``CONTROLLER_BUSY`` / ``BINDING_CHANGED``），所以「急停期间
+    一次都不会点下去」「租约被别人拿着时不会互相踩」「另一个会话改过绑定之后不会照着旧索引点到
+    别的应用上」都是结构上成立的，不靠各工具自觉。
     异常一律翻译成类型化错误码 —— ``ELEMENT_UNAVAILABLE`` / ``STALE_STATE`` 这类码模型要能
     直接分支，不能被挤进 INTERNAL 的文案里。
     """
@@ -151,7 +177,20 @@ def action(risk: bool = True):
                             ),
                             started,
                         )
+                    stale = _binding_check(kwargs.get("binding_id"))
+                    if stale:
+                        return _finish(
+                            ActionResult(
+                                ok=False, error="BINDING_CHANGED", possibly_sent=False, message=stale,
+                                detail={"hint": "重新 get_app 绑定目标，再 get_ax_state 拿新索引；不要用旧索引操作。"},
+                            ),
+                            started,
+                        )
                 result = fn(*args, **kwargs)
+                if risk and result.ok:
+                    note = _binding_note(kwargs.get("binding_id"))
+                    if note:
+                        result.detail["notice"] = f"{result.detail.get('notice', '')} {note}".strip()
             except killswitch.Killed as e:
                 lease.release()   # 急停即交出控制器：别的会话/用户可以立刻接管
                 return _finish(

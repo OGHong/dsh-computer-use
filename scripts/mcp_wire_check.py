@@ -211,6 +211,70 @@ def main() -> int:
         check("observe 伪步可用，并显式声明索引已更新（索引不变量）",
               "[observe]" in obs and "索引已按本次观察更新" in obs, obs.splitlines()[-1][:90])
 
+    # --- 多会话串扰：一个服务器进程 + 两个逻辑调用者（任务书 §4.2 / §5.3） ----------
+    # 生产拓扑是「一个 DSH 实例 → 一个宿主级 server.py → N 个会话共用它」。从服务器这一侧看，
+    # 那就是「一条 stdio 连接上交替来两组调用」—— 正是下面这段。真起两个 DSH 会话也复现不出
+    # 更多东西：服务器根本无法区分调用者，这正是缺陷本身。
+    import re as _re
+
+    def binding_of(text: str) -> str:
+        m = _re.search(r"binding_id=(\S+?)[）（(]", text + "（")
+        return m.group(1) if m else ""
+
+    apps = [ln for ln in call_text("list_apps", {})[0].splitlines() if " pid: " in ln]
+    pids = [_re.search(r"pid: (\d+)", ln).group(1) for ln in apps]
+    if len(pids) < 2:
+        skip("多会话串扰（绑定令牌）", f"当前只有 {len(pids)} 个有界面的应用，需要两个")
+    else:
+        a_txt, _ = call_text("get_app", {"app": pids[0]})      # 会话 A 绑定 app1
+        b_a = binding_of(a_txt)
+        check("get_app 回显绑定令牌（会话 A）", bool(b_a), a_txt.splitlines()[-2][:100] if a_txt else "")
+        # 用 full 观察：diff 在界面没变化时一行都不回，这条断言要的是「索引区间」
+        seen, _ = call_text("get_ax_state", {"full": True, "binding_id": b_a})
+        check("get_ax_state 回显同一枚令牌（索引和令牌必须一起给模型）",
+              binding_of(seen) == b_a, f"观察里是 {binding_of(seen)!r}")
+        # 会话 B 在同一个服务器进程里绑另一个应用 —— 就是生产里发生的那一下
+        b_txt, _ = call_text("get_app", {"app": pids[1]})
+        b_b = binding_of(b_txt)
+        check("另一个调用者绑定别的应用 → 换了一枚新令牌", bool(b_b) and b_b != b_a, f"{b_a} → {b_b}")
+        b_seen, _ = call_text("get_ax_state", {"full": True, "binding_id": b_b})
+        nums_a = [int(x) for x in _re.findall(r"\[(\d+)\]", seen)]
+        nums_b = [int(x) for x in _re.findall(r"\[(\d+)\]", b_seen)]
+        check("换绑即抬索引纪元：两棵树的索引区间不重叠（旧索引不可能命中新树的同号元素）",
+              bool(nums_a) and bool(nums_b) and min(nums_b) > max(nums_a),
+              f"A 索引 {min(nums_a) if nums_a else '-'}~{max(nums_a) if nums_a else '-'} / "
+              f"B 索引 {min(nums_b) if nums_b else '-'}~{max(nums_b) if nums_b else '-'}")
+        # A 带着旧令牌去观察：不拦（观察无害），但必须醒目说明「这不是你要看的应用」
+        stale_view, _ = call_text("get_ax_state", {"full": True, "binding_id": b_a})
+        check("拿旧令牌观察会明确警告「这棵树不是你要观察的应用」（而不是让模型误会）",
+              "不是你要观察的那个应用" in stale_view, stale_view.splitlines()[0][:100])
+        # A 带着旧令牌动作：必须在**下发之前**被拦住
+        stale, _ = call_text("drag", {"from_x": 0, "from_y": 0, "to_x": 1, "to_y": 1,
+                                      "strategy": "a11y", "binding_id": b_a})
+        check("串改后 A 的动作被拒（BINDING_CHANGED，早于 a11y 分支，一次都没下发）",
+              "ERROR[BINDING_CHANGED]" in stale, stale[:110])
+        batch, _ = call_text("sequence", {"steps": [{"tool": "drag", "args": {"from_x": 0, "from_y": 0, "to_x": 1, "to_y": 1, "strategy": "a11y"}}],
+                                          "binding_id": b_a})
+        check("整批动作也拦（第一步之前就拒，0 步执行）",
+              "ERROR[BINDING_CHANGED]" in batch and "0 步" in batch, batch[:100])
+        cur, _ = call_text("drag", {"from_x": 0, "from_y": 0, "to_x": 1, "to_y": 1,
+                                    "strategy": "a11y", "binding_id": b_b})
+        check("当前令牌放行（走到动作层自己的 a11y 分支，证明拦的是令牌不是动作）",
+              "ACTION_UNAVAILABLE" in cur and "BINDING_CHANGED" not in cur, cur[:90])
+        noid, _ = call_text("drag", {"from_x": 0, "from_y": 0, "to_x": 1, "to_y": 1, "strategy": "a11y"})
+        check("不带令牌照旧放行（可选参数：不打断老会话与坐标路径）",
+              "ACTION_UNAVAILABLE" in noid and "BINDING_CHANGED" not in noid, noid[:90])
+        held, _ = call_text("release_lease", {"binding_id": b_a})
+        check("A 的 release_lease 不能释放 B 的租约（带旧令牌被拒）",
+              "ERROR[BINDING_CHANGED]" in held, held[:100])
+        freed, _ = call_text("release_lease", {"binding_id": b_b})
+        check("当前令牌可以正常释放自己的租约", "已释放控制器租约" in freed, freed[:80])
+        # 症状本身（§1.1）仍在：令牌把它从「静默点错应用」变成「可拦住」，不是隔离
+        info_txt, _ = call_text("screen_info", {})
+        line = next((ln for ln in info_txt.splitlines() if "已绑定应用" in ln), "")
+        check("如实报告：绑定仍是进程内共享的（screen_info 里点名了这条限制）",
+              "所有会话" in info_txt and f"binding_id={b_b}" in line, line[:90])
+
     # 主连接到这里就功成身退：下面的生命周期检查各用独立进程（Dock 图章要新进程，
     # 断连要能关掉一条连接的 stdin）。**之后不要再往 send/recv 上加检查**——它们会读到
     # EOF 并报成「服务器提前退出」，而真正的原因只是这条连接被主动关掉了。
@@ -492,6 +556,88 @@ def main() -> int:
         robber.wait(timeout=5)
     check("租约：release() 释放，且进程退出时 atexit 也会释放",
           lease.release() is True and not (leases_dir / f"{os.getpid()}.json").exists())
+
+    # --- 绑定令牌（任务书 §4.2）的进程内部分：可选性、提醒、只读查询不该换令牌 ---------
+    saved_binding = dict(server_mod._binding)
+    try:
+        server_mod._binding.update({"id": "", "pid": None, "name": "", "seq": 0})
+        check("没有绑定时不提醒（不给坐标路径刷屏）", server_mod._binding_note("") == "")
+        server_mod._bind_app({"pid": 4242, "name": "探针应用"})
+        first = server_mod._binding["id"]
+        check("每个动作都填 settle_ms 之外，绑定令牌也每次都换（否则拦不住旧索引）",
+              bool(first) and server_mod._binding["pid"] == 4242)
+        second = server_mod._bind_app({"pid": 4243, "name": "另一个探针"})
+        check("重新绑定 → 新令牌，旧令牌判失效",
+              second != first and server_mod._check_binding(first) and server_mod._check_binding(second) is None,
+              f"{first} → {second}")
+        check("不带令牌（可选参数）永远放行：老会话与坐标路径不受影响",
+              server_mod._check_binding("") is None and server_mod._check_binding(None) is None)
+        check("没带令牌时给一句提醒（绑定过应用、有索引可用时才加）",
+              "没带 binding_id" in server_mod._binding_note(""), server_mod._binding_note("")[:60])
+        before = server_mod._binding["id"]
+        server_mod._resolve_app("", bind=False)
+        check("list_windows 那种只读过滤不换令牌（查询不该有副作用）",
+              server_mod._binding["id"] == before)
+
+        # 提醒真的会挂到 ok 的结果尾部（用合成动作，不碰真实输入）
+        @action_layer.action(risk=True)
+        def _probe_ok(binding_id: str = ""):   # 和真实动作一样声明这个可选参数（否则批处理里会被丢弃）
+            return _AR(ok=True, effect="changed")
+
+        server_mod._ACTIONS["probe_ok"] = action_layer.ActionSpec(
+            name="probe_ok", fn=_probe_ok, render=lambda r: "probe" + action_layer.tail(r),
+            description="", risk=True
+        )
+        out = server_mod._run_sequence([{"tool": "probe_ok", "args": {}}], "continue", 5000, 20000)
+        check("动作结果尾部带「没带 binding_id」提醒（模型能自我纠正）",
+              "没带 binding_id" in out, out.splitlines()[1][:80])
+        with_id = server_mod._run_sequence([{"tool": "probe_ok", "args": {"binding_id": server_mod._binding["id"]}}],
+                                           "continue", 5000, 20000)
+        check("带上当前令牌就没有那句提醒（按指引做就不吵）",
+              "没带 binding_id" not in with_id, with_id.splitlines()[1][:80])
+        top = server_mod._run_sequence([{"tool": "probe_ok", "args": {}}], "continue", 5000, 20000,
+                                       server_mod._binding["id"])
+        check("sequence 顶层令牌下发给每一步（不带出每步一句噪声）",
+              "没带 binding_id" not in top, top.splitlines()[1][:80])
+        del server_mod._ACTIONS["probe_ok"]
+    finally:
+        server_mod._binding.update(saved_binding)
+
+    # --- 索引纪元：服务器被多会话共用时，「旧索引 → 新绑定」必须响亮失败（任务书 §2.4/§5.1） ---
+    saved_app = server_mod._bound_app
+    saved_bind = dict(server_mod._binding)
+    try:
+        apps = server_mod.ax.running_apps()
+        if len(apps) < 2:
+            skip("索引纪元（旧索引不得命中新绑定）", "当前不足两个有界面的应用")
+        else:
+            pid_a, pid_b = apps[0]["pid"], apps[1]["pid"]
+            server_mod._bind_app({"pid": pid_a, "name": "会话 A 的应用"})
+            obs_a = server_mod.ax.observer_for(pid_a)
+            obs_a.observe(full=True)
+            idx_a = max((n.idx for n in obs_a.nodes.values()), default=None)
+            server_mod._bind_app({"pid": pid_b, "name": "会话 B 的应用"})
+            obs_b = server_mod.ax.observer_for(pid_b)
+            obs_b.observe(full=True)
+            idx_b = min((n.idx for n in obs_b.nodes.values()), default=None)
+            check("换绑即抬纪元：新树的最小索引大于旧树的最大索引（数值上不可能撞号）",
+                  idx_a is not None and idx_b is not None and idx_b > idx_a, f"A 最大 {idx_a} → B 最小 {idx_b}")
+            stale = ""
+            try:
+                obs_b.node_by_index(idx_a)
+            except server_mod.AXBridgeError as e:
+                stale = e.code
+            check("旧索引在新绑定里查不到（ELEMENT_UNAVAILABLE/STALE_STATE，而不是命中同号元素）",
+                  stale in ("ELEMENT_UNAVAILABLE", "STALE_STATE"), f"{stale or '居然查到了'}")
+            try:
+                obs_a.node_by_index(idx_a)
+                alive = True
+            except server_mod.AXBridgeError:
+                alive = False
+            check("同一个绑定内的索引仍然有效（纪元只切断换绑前后的重叠，不误伤正常流程）", alive)
+    finally:
+        server_mod._bound_app = saved_app
+        server_mod._binding.update(saved_bind)
 
     # 落点保护：读不到窗口列表时必须 fail-closed，而不是静默放行
     saved_bound = server_mod._bound_app

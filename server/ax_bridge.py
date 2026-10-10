@@ -649,7 +649,7 @@ class AppObserver:
         self.pid = pid
         self.nodes: dict[str, _Node] = {}   # node_id -> node
         self.snapshot: dict[str, str] = {}  # node_id -> 行哈希
-        self.next_idx = 0
+        self.next_idx = _epoch[0]           # 索引从当前纪元开始（见 bump_index_epoch）
 
     def forget(self):
         for n in self.nodes.values():
@@ -806,6 +806,31 @@ class AppObserver:
 
 _OBSERVERS: dict[int, AppObserver] = {}
 _LOCK = threading.RLock()
+
+#: 索引纪元：**绑定目标一变就跳到下一个十万位**，于是两个绑定期发出去的索引在数值上永不重叠。
+#:
+#: 为什么必须有它（任务书 §2.4）：这个服务器是宿主级单例，同一 DSH 实例的所有会话共用它。
+#: 会话 A 观察计算器拿到 `[112]`，会话 B 一个 `get_app("Terminal")` 就把全局绑定改掉了 ——
+#: 此时 A 拿 112 去操作，服务器会在 Terminal 的树里找 112 号元素，**恰好存在就点下去了**。
+#: 有了纪元，Terminal 那棵树里的索引都 ≥ 新纪元基数，A 的 112 只会得到 `ELEMENT_UNAVAILABLE`
+#: （响亮地失败，提示重新观察），而不会命中另一个元素。它不替代隔离，但它让「静默点错应用」
+#: 这个最严重的后果在结构上不成立。
+_EPOCH_STEP = 100000
+_epoch = [0]
+
+
+def index_epoch() -> int:
+    """当前纪元基数（索引分配的起点）。"""
+    return _epoch[0]
+
+
+def bump_index_epoch() -> int:
+    """开一个新纪元：已有观察器的下一个索引也抬到新基数，之后分配的数字只增不减。"""
+    _epoch[0] += _EPOCH_STEP
+    with _LOCK:
+        for obs in _OBSERVERS.values():
+            obs.next_idx = max(obs.next_idx, _epoch[0])
+    return _epoch[0]
 
 
 def observer_for(pid: int) -> AppObserver:
