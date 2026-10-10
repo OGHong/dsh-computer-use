@@ -11,7 +11,10 @@
   - 等比缩放、不裁切（对齐 setPreservesAspectRatio / ResizeAspect）；
   - 整块画面可拖（对齐原生面板 setMovableByWindowBackground），不抢焦点、不进 Dock；
     拖完的位置记在 panel.pos 里，下次拉起还在原地（默认右下角）；
-  - 停手 20 秒 → 画面中央打绿色 ✓（完成态）；
+  - **完成勾与收起只看 agent 活动**（见 `_panel_state`）：这一轮还在跑就一直上屏；这一轮刚结束
+    就立刻打绿色 ✓，再安静 `DSH_CUA_HIDE_S`（默认 25 秒）收起。判据里**没有视频帧的 mtime** ——
+    帧只决定「有没有东西可看」。拿不到 host 半区的 `turn.json` 时退回纯时间判定
+    （`DSH_CUA_DONE_S` / `DSH_CUA_DORMANT_S`）。收起时写 `panel.state=hidden`，host 半区据此停掉抓屏；
   - 右上角 × = 「现在收起来」，**不是**「以后别再出现」：只 orderOut，进程留着，等 Agent
     安静够 HIDE_QUIET_S（默认 2 分钟，说明上一轮活儿干完了）之后的下一次动作，它自己回来
     —— 用户不需要去找任何「重新打开」的入口（用户侧本来也没有：没有菜单栏图标、没有 Dock、
@@ -21,8 +24,8 @@
     server/killswitch.py 同一个 `kill` 文件，MCP 服务器在下一个可中断点（≤0.1 秒）进入只读，
     动作类工具从此回 ERROR[KILLED]。急停期间浮窗**一直显示**（否则用户找不到恢复入口），
     再按一下 ▶ 解除 —— 它是这个功能唯一的用户侧入口，状态必须一直看得见；
-  - 没人用了就自己藏起来：超过 DORMANT_S 秒没有新动作/心跳 → orderOut，下一次动作
-    自动回来；拉起它的 MCP 服务器退出 → 本进程一起退出，不留孤儿窗口。
+  - 没人用了就自己藏起来（判据同上）→ orderOut，下一次动作自动回来；
+    拉起它的 MCP 服务器退出 → 本进程一起退出，不留孤儿窗口；停手 IDLE_EXIT_S 之后整个进程退出。
 
 由 server.py 在第一次电脑操作时自动拉起（`DSH_CUA_NO_PANEL=1` 可关掉）；本脚本自身不依赖 MCP。
 """
@@ -75,10 +78,16 @@ HIDDEN = BASE / "panel.hidden"   # 开关状态（带时间戳：值变了才算
                                  # "on:" = 明确要开。server 只认 "off"。
 KILL = BASE / "kill"   # 急停标志，格式必须与 server/killswitch.py 一致：
                        # "on:<毫秒时间戳>:<原因>" = 只读；文件不存在 = 正常
+TURN = BASE / "turn.json"    # host 半区写：{agent, running, at} —— 这一轮还在不在跑
+STATE = BASE / "panel.state"  # 本进程写："up:<ts>" / "hidden:<ts>"（host 半区据此决定是否抓屏）
 
 WIDTH = 320
-DONE_S = 20.0
-DORMANT_S = 120.0
+# 完成勾（画面中央的绿 ✓）= 「这一轮干完了」。判据是 **agent 的活动**，不是有没有新视频帧：
+# 以前它挂在 latest.jpg 的 mtime 上，而 SCK 推流只要画面有变化（用户动一下鼠标、屏幕上任何
+# 动画）就重写那一帧 → ✓ 被抹掉。现在只有 agent 状态能影响它（见 `_panel_state`）。
+DONE_S = float(os.environ.get("DSH_CUA_DONE_S") or 8.0)     # 拿不到 agent 状态时的兜底：安静这么久 = 完成
+HIDE_S = float(os.environ.get("DSH_CUA_HIDE_S") or 25.0)    # 这一轮结束 + 安静这么久 → 收起（原来是 120 秒，太长了）
+DORMANT_S = float(os.environ.get("DSH_CUA_DORMANT_S") or 60.0)  # 拿不到 agent 状态时的兜底收起时间
 HIDE_QUIET_S = 120.0   # 点了 × 之后：Agent 安静够这么久 = 上一轮活儿干完了，解除收起
 IDLE_EXIT_S = 900.0   # 停手 15 分钟就整个退掉：任务完了不该留一个 ~35MB 的进程挂着，
                       # 下一次动作 server 会再把它拉起来（落点照 panel.pos 恢复）
@@ -106,10 +115,56 @@ def _agent_ts() -> float:
 	return max(_mtime(STATUS), _mtime(HEARTBEAT))
 
 
-def _fresh() -> bool:
-	"""有帧可看 + 最近 DORMANT_S 秒内还有动作 → 看得见；否则先藏起来（不退出，
-	等下一次动作自己回来）。"""
-	return SHOT.exists() and _agent_ts() > 0 and time.time() - _agent_ts() <= DORMANT_S
+def _turn_running() -> bool | None:
+	"""这台电脑上还有 agent 在跑吗 —— host 半区每 2 秒把「最近一次 computer-use 调用属于哪个
+	会话、它现在还在不在跑」写进 turn.json。
+
+	`None` = 拿不到（老版本 host 半区、独立运行、文件过期）→ 退回纯时间判定。
+	拿得到的时候才能做到「agent 在想事情的几十秒里窗不走、这一轮一结束就收起」。
+	"""
+	try:
+		rec = json.loads(TURN.read_text(encoding="utf-8"))
+		if time.time() * 1000 - int(rec.get("at") or 0) > 15000:   # host 半区每 4 秒续一次
+			return None
+		return bool(rec.get("running"))
+	except (OSError, ValueError, TypeError):
+		return None
+
+
+def _panel_state(now: float, agent_ts: float, running: bool | None) -> tuple[bool, bool]:
+	"""纯决策：(该不该上屏, 该不该打完成勾)。
+
+	**输入里没有视频帧的 mtime** —— 帧只决定「有没有东西可看」，不该决定「该不该显示/完成没完成」。
+	（这条就是那个 bug：用户一碰鼠标，SCK 推流重写 latest.jpg，✓ 就没了。）
+
+	  * agent 这一轮还在跑（running is True）→ 一直上屏、不打勾；
+	  * 这一轮刚结束（running is False）→ 立刻打勾（1.5 秒地板，免得连轴转时闪），
+	    再安静 HIDE_S 秒就收起；
+	  * 拿不到状态（None）→ 退回时间判定：安静 DONE_S 秒打勾、DORMANT_S 秒收起。
+	"""
+	if agent_ts <= 0 or not SHOT.exists():
+		return False, False
+	quiet = now - agent_ts
+	if running is True:
+		return True, False
+	limit = HIDE_S if running is not None else DORMANT_S
+	up = quiet <= limit
+	done = up and quiet >= 1.5 and (running is False or quiet >= DONE_S)
+	return up, done
+
+
+def _save_panel_state(up: bool) -> None:
+	"""把「在屏上 / 收起了」写进 panel.state —— host 半区据此决定还要不要为画面抓屏。
+
+	抓屏进程活着 = 系统录屏灯亮着。以前只要浮窗**进程**还在（哪怕早就收起了）就继续抓，
+	一停手还能白抓两分钟；现在收起就停（host 半区读这个文件，见 lib/index.js 的 panelWatching）。
+	"""
+	try:
+		tmp = STATE.with_suffix(".state.tmp")
+		tmp.write_text(f"{'up' if up else 'hidden'}:{int(time.time() * 1000)}", encoding="utf-8")
+		os.replace(tmp, STATE)
+	except OSError:
+		pass
 
 
 def _hide_expired(hide_at: float | None, agent_ts: float, now: float) -> bool:
@@ -178,14 +233,14 @@ def _parent_alive() -> bool:
 
 
 def _drop_lock() -> None:
-	for path in (LOCK, GEOMETRY):
+	for path in (LOCK, GEOMETRY, STATE):
 		try:
 			path.unlink()
 		except OSError:
 			pass
 
 
-def _report_geometry(panel) -> None:
+def _report_geometry(panel, done: bool = False) -> None:
 	"""把面板几何写进 panel.json —— 它是独立进程的浮层，不在 dsh 的 AX 树里，
 	Agent 的坐标路径只有拿到真实位置才能瞄到 × 和拖动手势。坐标一律用
 	「全局、左上角原点、y 向下」（与 CGWindowBounds 同一套），收起时删掉文件。"""
@@ -201,6 +256,8 @@ def _report_geometry(panel) -> None:
 	btn = panel.contentView().close.frame()
 	halt = panel.contentView().stop.frame()
 	payload = {
+		# 完成勾是不是正显示着（Agent 与测试都据此判断「这一轮画完了没有」）
+		"done": bool(done),
 		"x": round(frame.origin.x),
 		"y": round(top),
 		"width": round(frame.size.width),
@@ -468,17 +525,20 @@ def main():
 			_release_hide()      # 上一轮活儿干完了：回到自动模式，下一次动作浮窗自己回来
 		killed = _kill_on()
 		content._refresh_stop(killed)
+		up, done = _panel_state(now, agent_ts, _turn_running())
 		# 只在「藏 ↔ 显」切换时动窗口层级：每 250ms 反复 orderFront 是无谓的窗口服务
 		# 抖动（用户实测期间出现过两次 Mission Control，先把这个嫌疑源去掉）。
 		# 急停期间**一直显示**：▶ 是用户侧唯一的恢复入口，把它藏起来等于让用户没法恢复。
-		if killed or (_HIDE_AT is None and _fresh()):
+		if killed or (_HIDE_AT is None and up):
 			if not state["up"]:
 				panel.orderFrontRegardless()
 				state["up"] = True
+				_save_panel_state(True)
 		else:
 			if state["up"]:
 				panel.orderOut_(None)
 				state["up"] = False
+				_save_panel_state(False)
 			_report_geometry(None)
 			# 藏久了就整个退出（「任务完自动关闭」）：进程 ~35MB，没必要一直挂着；
 			# 下一次动作 server 会重新拉起，位置按 panel.pos 恢复。
@@ -486,14 +546,15 @@ def main():
 				_drop_lock()
 				NSApplication.sharedApplication().terminate_(None)
 			return
-		_report_geometry(panel)
+		_report_geometry(panel, done)
 		shot = _mtime(SHOT)
 		if shot and state["shown"] != shot:  # mtime 变了才解码，别每秒白读四次盘
 			image = NSImage.alloc().initWithContentsOfFile_(str(SHOT))
 			if image is not None:
 				content.image.setImage_(image)
 				state["shown"] = shot
-		content.badge.setHidden_(time.time() - max(shot, agent_ts) < DONE_S)
+		# 完成勾只跟 agent 状态走 —— 绝不掺视频帧的 mtime（一掺，用户动一下鼠标就把它抹掉）
+		content.badge.setHidden_(not done)
 
 	NSTimer.scheduledTimerWithTimeInterval_repeats_block_(0.25, True, tick)
 	app.run()

@@ -294,7 +294,9 @@ function mountCallerIdentity(ctx: HostContext): () => void {
     async (exec: ToolExecution, next: () => Promise<unknown>) => {
       if (!String(exec?.name ?? '').startsWith(CU_TOOL_PREFIX)) return next()
       await awaitGate()
-      const seq = publishCaller(String(exec?.agent?.id ?? '') || 'unknown', String(exec.name))
+      const agent = String(exec?.agent?.id ?? '') || 'unknown'
+      lastCuAgent = agent
+      const seq = publishCaller(agent, String(exec.name))
       exec.__cuaGateSeq = seq
       return next()
     },
@@ -328,6 +330,72 @@ function mountCallerIdentity(ctx: HostContext): () => void {
     }
     gateHolder = 0
     gateQueue.length = 0
+  }
+}
+
+/**
+ * 「这一轮还在不在跑」—— 浮窗靠它决定什么时候收起、什么时候打完成勾。
+ *
+ * 浮窗以前只看得到「最后一次动作是什么时候」，于是只有两个选择：要么很晚才收起（原来 120 秒，
+ * 任务早结束了窗还杵着），要么在 agent 想事情的几十秒里把窗收掉（长回合里闪进闪出）。
+ * host 半区知道得更多：`exec.agent.id`（谁在用电脑）+ `agents` 服务（它现在还在不在跑）。
+ */
+const TURN = `${BASE}/turn.json`
+/** 最近一次 computer-use 调用属于哪个会话（pre-execute 记下来的）。 */
+let lastCuAgent = ''
+/** housekeeping 是定时器回调、拿不到 ctx，只能在这里存一份（apply 时赋值）。 */
+let hostCtx: HostContext | null = null
+let lastTurnKey = ''
+let lastTurnAt = 0
+
+/** 这个会话现在还在跑吗？拿不到 `agents` 服务时返回 null（浮窗退回纯时间判定）。 */
+function agentRunning(id: string): boolean | null {
+  if (!id) return false
+  try {
+    const listed = hostCtx?.get('agents')?.list?.()
+    if (!Array.isArray(listed)) return null
+    const hit = listed.find((a) => a?.id === id)
+    return hit ? hit.status === 'running' : false // 会话已经没了 → 没在跑
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 把「这一轮还在不在跑」写给浮窗。值变了立刻写；没变也每 10 秒续一次心跳
+ * （浮窗拿 `at` 判断新鲜度，超过 15 秒就当拿不到、退回时间判定）。
+ */
+function publishTurn(): void {
+  if (!lastCuAgent) return
+  const running = agentRunning(lastCuAgent)
+  const key = `${lastCuAgent}|${String(running)}`
+  const now = Date.now()
+  // 没变也每 4 秒续一次心跳：浮窗那侧的新鲜窗口是 15 秒（留 3 倍余量，避免边界抖动）
+  if (key === lastTurnKey && now - lastTurnAt < 4_000) return
+  lastTurnKey = key
+  lastTurnAt = now
+  try {
+    mkdirSync(BASE, { recursive: true })
+    writeFileSync(`${TURN}.tmp`, JSON.stringify({ agent: lastCuAgent, running, at: now }))
+    renameSync(`${TURN}.tmp`, TURN)
+  } catch {
+    /* 下一轮再试：写不进去最多是浮窗晚一点收起 */
+  }
+}
+
+/**
+ * 浮窗在看着吗 = 进程活着 **且** 正显示着。
+ *
+ * 只看 `preview.lock` 的 pid 会让「收起之后」继续抓屏：浮窗收起时会写 `panel.state=hidden`，
+ * 据此停流 —— 抓屏进程活着意味着系统录屏灯亮着，一秒都不该白亮。
+ * 读不到 panel.state（老浮窗）时退回旧行为（只要进程在就算在看）。
+ */
+export function panelWatching(): boolean {
+  if (!panelAlive()) return false
+  try {
+    return readFileSync(`${BASE}/panel.state`, 'utf8').trim().startsWith('up')
+  } catch {
+    return true
   }
 }
 
@@ -408,9 +476,11 @@ function pumpFrames(actionMtime: number): void {
  * 测试能直接驱动这条路径（起流的真实调用点在生产里就是这个定时器）。
  */
 export function housekeeping(): void {
-  // 先喂帧：卡片退休之后，这个定时器是唯一会注意到「浮窗在看」的东西。
+  // 先把「这一轮还在不在跑」写给浮窗（它据此决定收起时间与完成勾）。
+  publishTurn()
+  // 再喂帧：卡片退休之后，这个定时器是唯一会注意到「浮窗在看」的东西。
   const actionMtime = activityMtime()
-  if (panelAlive() && Date.now() - actionMtime <= DORMANT_MS + 10000) {
+  if (panelWatching() && Date.now() - actionMtime <= DORMANT_MS + 10000) {
     lastDemand = Date.now()
     pumpFrames(actionMtime)
   }
@@ -559,6 +629,7 @@ function shutdown(): void {
  * @param ctx - Host context.
  */
 export function apply(ctx: HostContext): void {
+  hostCtx = ctx // housekeeping（定时器）要靠它问 agents 服务
   // 帧管线：定时器与抓屏子进程都挂在这一次 effect 上，插件卸载即全部归还。
   try {
     ctx.effect(() => {
@@ -727,7 +798,7 @@ export function apply(ctx: HostContext): void {
               // 那条 MJPEG 连接还挂着、<img> 卡在 loading 不会自己重连，画面会永久冻死。
               // 看的人 = 预览浮窗（读 preview.lock 的 pid）或（若还留着卡片实现）带 view=1 的轮询。
               // helper 起不来才退回 screencapture 那条老路。
-              const demand = liveUse && (panelAlive() || (watching && !card.startsWith('off')))
+              const demand = liveUse && (panelWatching() || (watching && !card.startsWith('off')))
               if (demand) pumpFrames(actionMtime)
               res.writeHead(200, {
                 'content-type': 'application/json',

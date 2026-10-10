@@ -322,5 +322,54 @@ if ((listeners.get('tools/pre-execute') ?? []).length !== 0 || (listeners.get('t
 	throw new Error('卸载后监听器还挂着 —— 热替换会叠加钩子')
 console.log('✓ 卸载收回调用者身份管线（监听器清空）')
 
+// --- 观察窗的收起判据：turn.json（这一轮还在不在跑）+ panel.state（在屏上才抓屏）---
+// 用户报的两个症状都在这一层：绿勾被鼠标一动就抹掉（帧 mtime 掺进了判据）、
+// 以及任务结束后窗还杵着两分钟。浮窗侧的纯函数由 scripts/panel-check.py 打矩阵，
+// 这里验 host 侧写出去的那两个文件。
+const turnFile = `${DIR}/turn.json`
+const withAgents = (status) => ({
+	effect: (fn) => fn(),
+	connection: { admit: () => ({}) },
+	webServer: { register: () => () => {} },
+	get: (name) => (name === 'agents' ? { list: () => [{ id: 'session-AAA', status }] } : undefined),
+	on: (event, fn, options) => {
+		const arr = listeners.get(event) ?? []
+		arr.push({ fn, options })
+		listeners.set(event, arr)
+		return () => {
+			const now = listeners.get(event) ?? []
+			listeners.set(event, now.filter((e) => e.fn !== fn))
+		}
+	}
+})
+mod.apply(withAgents('running'))
+const preTurn = (listeners.get('tools/pre-execute') ?? [])[0]?.fn
+if (typeof preTurn !== 'function') throw new Error('重新 apply 之后没有登记 pre-execute')
+await preTurn({ name: 'mcp__computer-use__screen_info', callId: 'c9', agent: { id: 'session-AAA' } }, nextOk)
+mod.housekeeping()
+const turn1 = JSON.parse(readFileSync(turnFile, 'utf8'))
+if (turn1.agent !== 'session-AAA' || turn1.running !== true)
+	throw new Error(`turn.json 没写出「这一轮在跑」：${JSON.stringify(turn1)}`)
+console.log(`✓ turn.json：agent=${turn1.agent} running=${turn1.running}（浮窗据此不收起）`)
+
+mod.apply(withAgents('idle'))
+mod.housekeeping()
+const turn2 = JSON.parse(readFileSync(turnFile, 'utf8'))
+if (turn2.running !== false) throw new Error(`回合结束后 turn.json 没更新：${JSON.stringify(turn2)}`)
+console.log('✓ turn.json：回合结束 → running=false（浮窗据此 25 秒后收起、并打完成勾）')
+
+// panel.state：收起之后就别再抓屏了（抓屏进程活着 = 系统录屏灯亮着）
+const stateFile = `${DIR}/panel.state`
+const fakeWatch = spawn('sleep', ['30'], { stdio: 'ignore' })
+writeFileSync(`${DIR}/preview.lock`, String(fakeWatch.pid))
+rmSync(stateFile, { force: true })
+if (!mod.panelWatching()) throw new Error('没有 panel.state（老浮窗）时应当退回旧行为：算在看')
+writeFileSync(stateFile, `hidden:${Date.now()}`)
+if (mod.panelWatching()) throw new Error('浮窗收起了却还在抓屏 —— 录屏灯会一直亮着')
+writeFileSync(stateFile, `up:${Date.now()}`)
+if (!mod.panelWatching()) throw new Error('浮窗在屏上却没抓屏 —— 画面会冻住')
+fakeWatch.kill()
+console.log('✓ panel.state：收起 → 停流；在屏上 → 继续抓屏；老浮窗（没这文件）退回旧行为')
+
 rmSync(DIR, { recursive: true, force: true })
 

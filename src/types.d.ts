@@ -48,8 +48,9 @@ export interface ConnectionService {
   admit(req: IncomingMessage): Admission
 }
 
-/** `agents.list()` 里本插件关心的形状。 */
+/** `agents.list()` 里本插件关心的形状。`id` 就是会话 id（= `exec.agent.id`）。 */
 export interface AgentLike {
+  id?: string
   status?: string
 }
 

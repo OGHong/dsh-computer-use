@@ -52,7 +52,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json",
-    "check": "sh -n scripts/install.sh && sh -n scripts/build_capture.sh && node scripts/client-smoke.mjs && node scripts/host-smoke.mjs && sh scripts/lint_py.sh && .venv/bin/python scripts/mcp_wire_check.py",
+    "check": "sh -n scripts/install.sh && sh -n scripts/build_capture.sh && node scripts/client-smoke.mjs && node scripts/host-smoke.mjs && .venv/bin/python scripts/panel-check.py && sh scripts/lint_py.sh && .venv/bin/python scripts/mcp_wire_check.py",
     "verify": "npm run typecheck && npm run build && npm run check",
     "smoke": "node scripts/host-smoke.mjs",
     "smoke:client": "node scripts/client-smoke.mjs",
