@@ -31,7 +31,7 @@
     "capture/cua_capture.swift",
     "client/settings.js",
     "cordis.patch.yml",
-    "docs/images",
+    "docs",
     "lib/index.js",
     "scripts/build_capture.sh",
     "scripts/install.sh",
