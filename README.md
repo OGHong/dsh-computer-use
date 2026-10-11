@@ -1,5 +1,55 @@
 # dsh-computer-use
 
+**让 DeepSeek Harness 的 Agent 看屏幕、动鼠标键盘、按元素操作界面。**
+
+一个 DSH 插件：内置 stdio MCP 服务器（标准库 JSON-RPC + 纯 ctypes 的 Accessibility / CoreGraphics +
+screencapture），以 `mcp__computer-use__*` 工具出现在会话里，并在 **设置 → 电脑操控** 里给出观察窗开关、
+收起时机、急停与权限指引。对齐 ZCode 内置 computer-use 的能力。
+
+macOS 13+（Intel / Apple Silicon） · Python 3.10+（实测 3.12） · MIT · 稳态常驻 16MB（见「轻量」一节）
+
+![设置 → 电脑操控](docs/images/settings-page.png)
+
+## 它长什么样
+
+**观察窗** —— Agent 每次碰电脑时自动浮出一块小窗，实时显示它看到的画面；你可以一直看着它做，
+也可以按左上角的 ⏹ 立刻叫停（与 `stop` 工具等价，下一个可中断点 ≤0.1 秒停下）。
+
+**设置页**（上图）—— 观察窗总开关（关掉就不再自动出现，也不再占用录屏与 CPU）、回合结束后多久
+收起、急停 / 恢复、观察窗状态与最近一次电脑操作、两项系统权限怎么给。
+
+## 快速开始
+
+```bash
+git clone https://github.com/OGHong/dsh-computer-use && cd dsh-computer-use
+sh scripts/install.sh     # 一条命令：venv + 依赖 + 构建 Host 半区 + 写 patch 路径 + 抓屏 helper
+```
+
+1. 把插件加进 profile：插件页安装本包，或在 profile 的 `package.json` 里声明依赖 + 加进
+   `dsh.profile.bundles`，然后重启 DeepSeek Harness；
+2. 系统设置 → 隐私与安全性 → 给 **DeepSeek Harness** 授予「辅助功能」和「屏幕录制」；
+3. 在会话里说一句「帮我看看屏幕上有什么」，它会调 `screen_info` / `screenshot`。
+
+## 工具一览
+
+| 分类 | 工具 |
+|---|---|
+| 先看 | `screen_info` `screenshot` `list_apps` `list_windows` |
+| 绑定应用（同时取控制器租约） | `get_app` `focus_app` `focus_window` `release_lease` |
+| 元素路径（优先） | `get_ax_state` `elements` `click_element` `set_value` `perform_action` `select_text` |
+| 坐标路径（兜底） | `click` `drag` `scroll` `type_text` `press_key` `paste` `wait` `launch_app` |
+| 批处理与安全 | `sequence` `stop` `resume` `preview` |
+| 其它 | `run_shell` `open_permission_settings` |
+
+每个工具的参数、返回的 `effect` 证据、失败码与设计取舍都在下面各节；`sequence` 能做的 = 工具能做的
+（同一份清单，见 `server/action_layer.py`）。
+
+---
+
+# dsh-computer-use
+
+## 实现概览
+
 让 DeepSeek Harness 的 Agent **看屏幕、动鼠标键盘、按元素操作界面**：对齐 ZCode 内置
 computer-use 的能力。内置一个 stdio MCP 服务器（`server/server.py` + `server/ax_bridge.py`，
 标准库 JSON-RPC + 纯 ctypes 的 Accessibility / CoreGraphics + screencapture），通过插件自带的
