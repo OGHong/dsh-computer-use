@@ -1,11 +1,11 @@
+[English](README.en.md) | **中文**
+
 # dsh-computer-use
 
 **让 DeepSeek Harness 的 Agent 看屏幕、动鼠标键盘、按元素操作界面。**
 
 一个 DSH 插件（macOS）：内置 stdio MCP 服务器，以 `mcp__computer-use__*` 工具出现在会话里，
 并在 **设置 → 电脑操控** 里提供观察窗开关、急停与权限指引。
-
-macOS 13+（Intel / Apple Silicon） · Python 3.10+ · MIT
 
 ![设置 → 电脑操控](docs/images/settings-page.png)
 
@@ -15,21 +15,46 @@ Agent 每次碰电脑时，屏幕上会浮出一块**观察窗**，实时显示�
 也可以按左上角的 ⏹ 立刻叫停（下一个可中断点 ≤0.1 秒）。设置页（上图）里能关掉观察窗、
 选回合结束后多久自动收起、手动急停 / 恢复，并查看两项系统权限的状态。
 
+## 运行要求
+
+| | |
+|---|---|
+| 系统 | macOS 13+（Intel / Apple Silicon 都可以） |
+| Python | 3.10+（实测 3.12 最稳；python.org 的 framework 版最好） |
+| Node | 22+ 与 npm（构建 Host 半区用；`lib/` 是产物，不在仓库里） |
+| DeepSeek Harness | 桌面版（插件通过 profile 的 `dsh.profile.bundles` 接入） |
+| 系统权限 | 「辅助功能」+「屏幕录制」两项，见下 |
+| 磁盘 | 约 130MB（其中 `.venv` 96MB） |
+| 可选 | Xcode Command Line Tools —— 只为编译抓屏 helper；不装会自动退回 `screencapture` |
+
 ## 安装
+
+一条命令，可重复执行：
 
 ```bash
 git clone https://github.com/OGHong/dsh-computer-use && cd dsh-computer-use
-sh scripts/install.sh      # 建 venv、装依赖、把 patch 里的路径改成本机目录
+sh scripts/install.sh
 ```
 
-然后两步手工：
+它把这些都做完：
 
-1. 把插件加进 profile：在插件页安装本包，或在 profile 的 `package.json` 里声明依赖 +
-   加进 `dsh.profile.bundles`，重启 DeepSeek Harness；
-2. 系统设置 → 隐私与安全性 → 给 **DeepSeek Harness** 开「辅助功能」和「屏幕录制」
-   （截图黑屏 / 点击无效，就是这两项没给）。
+1. 建 `.venv` 并装依赖（含预览浮窗要的 pyobjc）；
+2. 构建 Host 半区（`src/index.ts` → `lib/index.js`）；
+3. 把 `cordis.patch.yml` 里的绝对路径改成本机插件目录；
+4. 没有抓屏 helper 就试着编一个（失败自动退回 `screencapture`）；
+5. **接进 profile**：`package.json` 里加 `link:` 依赖 + 加进 `dsh.profile.bundles` +
+   建 `node_modules` 符号链接（改前先备份 `package.json`）；
+6. 打开「系统设置 → 隐私与安全性」里那两项权限面板。
 
-换一台 Mac 同样这两步。
+想先看它要做什么：`sh scripts/install.sh --dry-run`；
+指定 profile：`--profile=web`；不想让它开设置面板：`--no-open-settings`。
+
+**之后只剩两件谁也替不了你的事** —— 这不是插件偷懒：
+
+1. **重启 DeepSeek Harness**：宿主与客户端的插件清单都在启动时扫描，热替换不会重读；
+2. **在系统设置里点开那两项开关**：「辅助功能」（控制鼠标键盘）与「屏幕录制」（截屏）。
+   macOS 的 TCC 权限不允许任何程序给自己授权，只能你点；没授权时截图黑屏、点击无效，
+   `screen_info` 会如实报告状态。
 
 ## 用起来
 
@@ -65,12 +90,6 @@ sh scripts/install.sh      # 建 venv、装依赖、把 patch 里的路径改成
 | 回合结束后自动收起 | 5 秒 / 12 秒 / 30 秒 / 1 分钟 / 2 分钟 |
 | 急停 / 恢复 | 与观察窗左上角的 ⏹ 等效：下一个可中断点（≤0.1 秒）停下 |
 | 权限 | 一键跳到「系统设置 → 辅助功能」 |
-
-## 权限
-
-首次使用需要在「系统设置 → 隐私与安全性」里给 **DeepSeek Harness** 开两项：
-「辅助功能」（控制鼠标键盘）和「屏幕录制」（截屏）。未授权时点击无效、截图为黑屏；
-`screen_info` 会如实报告权限状态。
 
 ## 配置覆盖
 
