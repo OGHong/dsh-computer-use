@@ -25,7 +25,7 @@ the state of the two macOS permissions.
 | OS | macOS 13+ (Intel or Apple Silicon) |
 | Python | 3.10+ (3.12 is what it is tested on; the python.org framework build is best) |
 | Node | 22+ with npm (to build the host half; `lib/` is a build artifact and is not in the repo) |
-| DeepSeek Harness | desktop app (the plugin is wired in through `dsh.profile.bundles`) |
+| DeepSeek Harness | **0.2.0-rc.2 or newer (0.2.x)** — declared in `peerDependencies`; DSH refuses to load it on an incompatible version |
 | Permissions | Accessibility + Screen Recording, see below |
 | Disk | ~130 MB (`.venv` is 96 MB of that) |
 | Optional | Xcode Command Line Tools — only to compile the capture helper; without it the plugin falls back to `screencapture` |
