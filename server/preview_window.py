@@ -78,6 +78,9 @@ HIDDEN = BASE / "panel.hidden"   # 开关状态（带时间戳：值变了才算
                                  # "off:" = 明确不再自动出现（只有 preview(True) 能解）；
                                  # "hide:" = 用户点了 ×，本次活跃期内先收起来；
                                  # "on:" = 明确要开。server 只认 "off"。
+CONF = BASE / "panel.conf"   # host 半区（设置页）写的偏好镜像：收起延时 /
+                             # 「这一轮先收起·现在恢复显示」请求。本进程每拍重读（1 秒 TTL），
+                             # 所以设置页改一下**不需要重启任何进程**就生效。
 KILL = BASE / "kill"   # 急停标志，格式必须与 server/killswitch.py 一致：
                        # "on:<毫秒时间戳>:<原因>" = 只读；文件不存在 = 正常
 TURN = BASE / "turn.json"    # host 半区写：{agent, running, at} —— 这一轮还在不在跑
@@ -119,6 +122,53 @@ def _agent_ts() -> float:
 	return max(_mtime(STATUS), _mtime(HEARTBEAT))
 
 
+# ---- 设置页写进来的偏好（panel.conf） -------------------------------------------
+# host 半区在设置页改一下就把整份 conf 原子替换掉。这里 1 秒 TTL 缓存：250ms 的 tick 每拍
+# 读一次盘是白读（一个 tick 里 _conf 会被问三次），而 1 秒的延迟用户感觉不到。
+_CONF_TTL_S = 1.0
+_conf_cache: dict = {"at": 0.0, "value": None}
+
+
+def _conf() -> dict:
+	"""读偏好镜像。文件不在 / 坏了 / 不是对象都退回空字典 = 全部默认行为。"""
+	now = time.time()
+	cached = _conf_cache["value"]
+	if cached is not None and now - float(_conf_cache["at"]) < _CONF_TTL_S:
+		return cached
+	try:
+		raw = json.loads(CONF.read_text(encoding="utf-8"))
+		value = raw if isinstance(raw, dict) else {}
+	except (OSError, ValueError):
+		value = {}
+	_conf_cache["at"] = now
+	_conf_cache["value"] = value
+	return value
+
+
+def _conf_hide_seconds() -> float | None:
+	"""这一轮结束后安静多久收起（设置页的「自动收起」）。拿不到就是 None = 用内置默认。"""
+	raw = _conf().get("autoHideSeconds")
+	if raw is None:
+		return None
+	try:
+		return max(1.0, min(float(raw), 3600.0))
+	except (TypeError, ValueError):
+		return None
+
+
+def _conf_hide_request() -> tuple[str, float]:
+	"""设置页的「这一轮先收起 / 现在恢复显示」：(动作, 毫秒 nonce)。
+
+	nonce 与 panel.hidden 同一套语义：值没变就不算新指令 —— 否则 250ms 的 tick 会把
+	「收起时刻」每拍重置一次，窗永远收不掉。"""
+	action = str(_conf().get("hideRequest") or "")
+	try:
+		at = float(_conf().get("hideRequestAt") or 0)
+	except (TypeError, ValueError):
+		at = 0.0
+	return action, at
+
+
 def _turn_running() -> bool | None:
 	"""这台电脑上还有 agent 在跑吗 —— host 半区每 2 秒把「最近一次 computer-use 调用属于哪个
 	会话、它现在还在不在跑」写进 turn.json。
@@ -138,7 +188,8 @@ def _turn_running() -> bool | None:
 		return None
 
 
-def _panel_state(now: float, agent_ts: float, running: bool | None) -> tuple[bool, bool]:
+def _panel_state(now: float, agent_ts: float, running: bool | None,
+                 hide_s: float | None = None) -> tuple[bool, bool]:
 	"""纯决策：(该不该上屏, 该不该打完成勾)。
 
 	**输入里没有视频帧的 mtime** —— 帧只决定「有没有东西可看」，不该决定「该不该显示/完成没完成」。
@@ -146,7 +197,7 @@ def _panel_state(now: float, agent_ts: float, running: bool | None) -> tuple[boo
 
 	  * agent 这一轮还在跑（running is True）→ 一直上屏、不打勾；
 	  * 这一轮刚结束（running is False）→ 立刻打勾（1.5 秒地板，免得连轴转时闪），
-	    再安静 HIDE_S 秒就收起；
+	    再安静 `hide_s` 秒就收起（None = 用内置的 HIDE_S / DORMANT_S）；
 	  * 拿不到状态（None）→ 退回时间判定：安静 DONE_S 秒打勾、DORMANT_S 秒收起。
 	"""
 	if agent_ts <= 0 or not SHOT.exists():
@@ -154,7 +205,7 @@ def _panel_state(now: float, agent_ts: float, running: bool | None) -> tuple[boo
 	quiet = now - agent_ts
 	if running is True:
 		return True, False
-	limit = HIDE_S if running is not None else DORMANT_S
+	limit = hide_s if hide_s is not None else (HIDE_S if running is not None else DORMANT_S)
 	up = quiet <= limit
 	done = up and quiet >= 1.5 and (running is False or quiet >= DONE_S)
 	return up, done
@@ -197,14 +248,18 @@ def _hide_expired(hide_at: float | None, agent_ts: float, now: float,
 	return prev_running is False and running is True
 
 
-def _request_hide() -> None:
-	"""用户点了 ×：立刻收起（下一拍 tick 里 orderOut），并记下时刻。
+def _request_hide(save: bool = True) -> None:
+	"""用户点了 ×（或设置页按了「这一轮先收起」）：立刻收起（下一拍 tick 里 orderOut），并记下时刻。
 
 	不写 "off"（那是 preview(False) 的语义，会让 server 永远不再自动拉起），
-	只写 "hide:" 便于外部观察状态。"""
+	只写 "hide:" 便于外部观察状态。
+
+	`save=False` 是给设置页那条路用的：那种情况下 `panel.hidden` 可能正是 host 半区为
+	「不再自动出现」写的 "off"，被这里覆盖成 "hide" 就等于把粘性开关偷偷打开了。"""
 	global _HIDE_AT  # noqa: PLW0603
 	_HIDE_AT = time.time()
-	_save_hidden("hide")
+	if save:
+		_save_hidden("hide")
 
 
 def _kill_on() -> bool:
@@ -233,12 +288,15 @@ def _set_kill(on: bool, reason: str) -> None:
 		pass
 
 
-def _release_hide() -> None:
+def _release_hide(save: bool = True) -> None:
 	"""解除临时收起：回到自动模式（下一次动作按活跃度自己上屏），并把状态写回文件 ——
-	否则 panel.hidden 里会一直留着一条已经失效的 "hide:"，外部排查时看着像还收着。"""
+	否则 panel.hidden 里会一直留着一条已经失效的 "hide:"，外部排查时看着像还收着。
+
+	`save=False` 同 `_request_hide`：设置页那条路不碰 `panel.hidden`。"""
 	global _HIDE_AT  # noqa: PLW0603
 	_HIDE_AT = None
-	_save_hidden("auto")
+	if save:
+		_save_hidden("auto")
 
 
 def _parent_alive() -> bool:
@@ -470,11 +528,28 @@ def _save_origin(win) -> None:
 		pass
 
 
+def _hidden_is_off() -> bool:
+	"""粘性开关是不是关着的（panel.hidden 以 "off" 开头）。
+
+	"off" 只有设置页与 Agent 的 preview(False) 会写 —— 它是「以后别再自动出现」。"""
+	try:
+		return HIDDEN.read_text(encoding="utf-8").strip().startswith("off")
+	except OSError:
+		return False
+
+
 def _save_hidden(state: str) -> None:
 	"""记下「用户关掉了」/「明确要开」——server 侧据此决定要不要自动拉起。
 
 	和 card.txt 同一套 nonce 语义：带毫秒时间戳，只有值真的变了才算一次新指令，
-	否则用户点过 × 之后，Agent 再写一次同样的 off/on 没有任何信号。"""
+	否则用户点过 × 之后，Agent 再写一次同样的 off/on 没有任何信号。
+
+	**不许用 "hide"/"auto" 覆盖 "off"**：那是把粘性开关偷偷打开 —— 用户刚在设置页关掉
+	观察窗，随手点一下浮窗的 ×（或者下一轮开始时那次自动解除）就会让它重新自动出现，
+	而他根本不知道自己动了什么。"on" 是**明确要开**（Agent 的 preview(True) 或设置页把
+	开关拨回来），它当然可以清掉 "off"。"""
+	if state in ("hide", "auto") and _hidden_is_off():
+		return
 	try:
 		tmp = HIDDEN.with_suffix(".hidden.tmp")
 		tmp.write_text(f"{state}:{int(time.time() * 1000)}", encoding="utf-8")
@@ -533,7 +608,7 @@ def main():
 	panel.makeKeyAndOrderFront_(None)
 	panel.orderFrontRegardless()
 
-	state = {"shown": None, "up": False, "turn": None}
+	state = {"shown": None, "up": False, "turn": None, "hide_req": 0.0}
 
 	def tick(timer):  # noqa: ARG001 - NSTimer block 签名
 		if not _parent_alive() or _QUIT:
@@ -543,13 +618,23 @@ def main():
 		now = time.time()
 		agent_ts = _agent_ts()
 		running = _turn_running()
+		# 设置页的「这一轮先收起 / 现在恢复显示」：与浮窗上的 × 同一套语义，只是从 panel.conf
+		# 进来。只在 nonce 变了的时候动一次 —— 否则每拍都会把「收起时刻」重置成现在，
+		# 窗就永远收不掉了。
+		action, at = _conf_hide_request()
+		if at and at != state["hide_req"]:
+			state["hide_req"] = at
+			if action == "hide":
+				_request_hide(save=False)
+			elif action == "release":
+				_release_hide(save=False)
 		release = _hide_expired(_HIDE_AT, agent_ts, now, running, state["turn"])
 		state["turn"] = running       # 先记下这一拍：下一拍才判得出「新一轮开始」这个沿
 		if release:
 			_release_hide()           # 下一轮开始了：回到自动模式，浮窗照常自己上屏
 		killed = _kill_on()
 		content._refresh_stop(killed)
-		up, done = _panel_state(now, agent_ts, running)
+		up, done = _panel_state(now, agent_ts, running, _conf_hide_seconds())
 		# 只在「藏 ↔ 显」切换时动窗口层级：每 250ms 反复 orderFront 是无谓的窗口服务
 		# 抖动（用户实测期间出现过两次 Mission Control，先把这个嫌疑源去掉）。
 		# 急停期间**一直显示**：▶ 是用户侧唯一的恢复入口，把它藏起来等于让用户没法恢复。

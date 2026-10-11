@@ -727,7 +727,7 @@ def _pick_window(wins: list[dict], spec: str) -> dict | None:
     """按序号或标题挑窗口。
 
     序号在抬窗之后会重排（AXWindows 是按前后顺序编号的），所以标题更稳 —— 实测就踩过
-    「记住窗口[1] 是 oghong，抬完一次再按 window=1 打到了下载上」。
+    「记住窗口[1] 是某个 App，抬完一次再按 window=1 打到了下载上」。
     """
     spec = str(spec).strip()
     if spec.isdigit():

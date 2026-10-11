@@ -264,7 +264,8 @@ agent 作用域还允许复用同名 `serverName`（`dsh-mcp-client/lib/index.js
   读文件、写代码时同样「安静」，这一轮远没结束。实测：安静已 195 秒时点 ×，0.30 秒后窗回到屏上；
   安静不足 120 秒时，也总在安静到 120 秒那一刻自己弹回来。现在解除只看「下一轮开始了没有」，
   拿不到 `turn.json`（老 host 半区，或 host 拿不到 `agents` 服务、写的是 `"running": null`）时
-  才退回时间判定 `HIDE_QUIET_S`（默认 2 分钟）。「以后别再自动出现」只归 `preview(enable=False)`，
+  才退回时间判定 `HIDE_QUIET_S`（默认 2 分钟）。「以后别再自动出现」归 `preview(enable=False)` 与
+  **设置页那个总开关**（见下面「设置页」一节；用户侧终于有了入口），
   它仍是粘性的，但结果文案明确写出恢复办法，且 off 期间每个动作的结果尾部都会带上那条提示
   （v2 里它是结构化 hint 码：动作层只塞 `detail["hints"]`，文案在 `action_layer.HINTS`，
   v1 那句 `_panel_hint()` 已随分层一起去掉），Agent 不会在用户已经失去监督面的情况下继续闷头操作。
@@ -305,6 +306,100 @@ agent 作用域还允许复用同名 `serverName`（`dsh-mcp-client/lib/index.js
 - 调参：`DSH_CUA_STREAM_WIDTH`（默认 512，浮窗 320 pt @dpr2 够用）、
   `DSH_CUA_STREAM_FPS`（默认 30）、`DSH_CUA_STREAM=0` 强制走回落、
   `DSH_CUA_LIVE=0` 完全关掉自补帧。实测 512@30fps：31.6KB/帧、~920KB/s、helper 8.7% CPU（15fps 档是 33.7KB/帧、4.0% CPU，帧间变化小所以每帧体积几乎不变）。
+
+## 设置页（设置 → 电脑操控）
+
+用户侧终于有一个**找得到的开关**。观察窗自己那两个键（× = 这一轮先别给我看、⏹ = 急停）都只解决
+「现在」，而「以后别再自动出现」以前只有 Agent 的 `preview(enable=False)` 能写 —— 用户想恢复也没有
+入口（上面那条真事故）。现在这一栏承担：
+
+| 控件 | 作用 | 落点 |
+|---|---|---|
+| 自动显示观察窗 | 关掉后不再自动弹出，并结束当前浮窗进程 | `~/.dsh/computer-use/settings.json` + `<BASE>/panel.hidden=off` |
+| 回合结束后自动收起 | 5 / 12 / 30 秒 / 1 / 2 分钟（默认 12 秒，一排 Pill） | `<BASE>/panel.conf` |
+| 急停 / 恢复 | 与 ⏹、MCP 的 `stop` 工具写同一个文件 | `<BASE>/kill` |
+| 状态行 | 观察窗在不在屏上 + 最近一次电脑操作 | — |
+| 权限 | 两项系统权限怎么给（含「打开辅助功能设置」按钮） | — |
+
+分工与「谁说了算」：
+
+- **`panel.hidden` 是运行时真相**：Agent 的 `preview(False)` 也写它，所以读设置时把它折叠回落盘的
+  偏好 —— 否则 Agent 关掉之后设置页还显示「开着」，重启还会把它复活。
+- **`panel.conf` 是浮窗每拍重读的偏好镜像**（1 秒 TTL）：收起延时、以及「关掉总开关时让已经开着的那块窗
+  当场消失」这条请求都从这里走，
+  所以改设置**不需要重启任何进程**。里面带毫秒 nonce（严格递增），值变了才算一条新指令。
+- **`/tmp` 会被系统清掉**，所以「不再自动出现」另有一份落盘副本；宿主启动时只强制 off 这一个方向，
+  反向（重新打开）必须由用户或 Agent 明确表达。
+- **粘性 off 不许被 × 覆盖**：`_save_hidden` 拒绝用 `hide`/`auto` 覆盖 `off`（`on` 可以）—— 否则
+  用户刚在设置页关掉观察窗，随手点一下 ×（或下一轮开始那次自动解除）就把它偷偷打开了。
+
+HTTP 契约（同源，走 `connection.admit`，与 `/stream`、`/status.json` 同一道门）：
+
+```
+GET  /_computer-use/settings.json   → { settings, runtime, choices, paths }
+POST /_computer-use/settings.json   → 部分字段即可；坏值保留原值、坏 JSON 400
+POST /_computer-use/permissions     → 打开系统设置的辅助功能面板（DSH_CUA_NO_OPEN=1 时不弹窗）
+POST /_computer-use/nav-icon        → 导航图标补丁的自检上报（写 <BASE>/nav-icon.log，超 8KB 留尾部）
+```
+
+客户端半区是**手写**的 bundle（`client/settings.js`，没有构建步骤）：一页而已，用不上打包器；它只
+require 平台 seed 词（`react` + `@deepseek-ai/dsh-client-ui-primitives`），任何一个缺失都安静地不出现，
+绝不把宿主页面带崩。版式是三张卡片（观察窗 / 控制 / 权限），控件全部来自官方 primitives
+（`Switch` / `Pill` / `Button` / `StateDot`），卡片用主题 token 自己写（背景层 + 1px 描边 +
+12 圆角，与「通用」设置页、dsh-pocket 的「手机访问」同一套观感），字号比官方设置行大一档
+（行标题 15 / 说明 13）—— 用户 2026-10-12 的要求。同一轮还按用户要求做了三次减法，都在
+`scripts/settings-smoke.mjs` 里钉成「不该再出现」的断言：
+
+  * **删掉三段说明**：三个「关掉」的区别、多会话共用键鼠、排查路径；
+  * **删掉两个开关/入口**：「完成后打勾」（打勾本来就是默认行为）与「这一轮先收起 / 恢复显示」
+    （浮窗上的 × 已经管这件事，设置页不再放镜像入口；`POST /_computer-use/panel` 随之删除，
+    `panel.conf` 的 `hideRequest` 现在只由「关掉总开关」产生）；
+  * **用词规范化**：页面上不再出现口语的「这一轮」，统一成产品自己的说法「回合」；
+    状态文案改成「运行中（显示）/（已收起）/ 未运行（下次操作时自动启动）/ 已关闭（不再自动显示）」。`scripts/settings-smoke.mjs` 钉住四件事：注册进 `settings.section`
+（id/order/label）、开关与状态反映的是哪份状态、点一下发出的请求长什么样、拿不到宿主时不崩。
+
+**新增或改动客户端半区后必须重启一次 DeepSeek Harness**：客户端清单在宿主启动时扫描并缓存
+（`dsh-client-modules` 的 `pkgMeta` 按 `baseUrl\0loaderName` 记住结论），改 `package.json` 里的
+`dsh.client` 不会热生效。
+
+### 导航图标：为什么设置页要自己动手补一个
+
+设置导航那一行的图标是壳里写死的一张 `id → 图标` 表（`navIcon(id)`，未命中就兜底成齿轮），而设置页
+注册项只有 `id` / `order` / `label` —— **平台没有给第三方设置页留图标位**。那张表在**应用自带的
+asar 里**：桌面版把 `/assets` 与所有 `@deepseek-ai/*` 客户端包都从 `app.asar/dsh` 发（profile 里那份
+同名包**根本不会被读** —— 实测它的 atime 停在安装那天），asar 又是应用签名的一部分，改不得。所以只剩
+一条路：**在页面里给那一行补图标**（`client/settings.js` 的 `installNavIcon`）。
+
+它的几条克制原则：
+
+* **只认结构，不认壳的哈希类名** —— 优先认「设置对话框（`[role="dialog"]`）里、文本完全等于本页
+  label、行首就是图标 svg、行高 40px（壳的导航行规格）」这四条；四条全中才动手。壳哪天改了行高或
+  图标不再是第一个子元素，再退一步按「文本 + 行里有图标」认（`scripts/settings-smoke.mjs` 里对两遍
+  匹配都有用例，还有「文本一样但没有图标」「文本一样但行高不对」两个诱饵，断言严格那一遍一个都不碰）；
+* **壳重渲染会换掉那一行**（切语言、关掉再打开设置面板），所以挂一个 body 级 MutationObserver 防抖
+  补一次，自己插入的节点带 `data-cu-nav-icon` 标记，绝不重复插；
+* **卸载时全部还原**（图标卸载、齿轮复原、观察器断开），冒烟用例逐条钉住。
+
+补丁**补不上时会留下现场**：`/_computer-use/nav-icon` 把结论追加到 `<BASE>/nav-icon.log`
+（补上了记一行 `patched`；设置对话框开着却认不出那一行，记一行 `probe` 并带上本页 label、对话框数、
+按钮文本抽样）—— 失败时页面上看不出任何区别，全靠这一行才知道为什么。日志超过 8KB 只留尾部。
+
+图标是**自己画的**（`client/settings.js` 的 `ComputerIcon`）：运行时那 188 个图标里没有
+电脑 / 显示器 / 笔记本（只有仪表、滑块、面板、全屏、检查这一类），而这一栏就是「电脑操控」，
+所以照壳自己的画法画了一台显示器 —— `viewBox 0 0 16 16`、`fill: none`、每条 path
+`stroke: currentColor`、线宽取 primitives 的 `ICON_MEDIUM_STROKE`（1.3，与相邻图标同粗细），
+也不额外设 linecap（壳的图标都是默认方头）。形状：机身（圆角矩形）+ 支颈 + 底座，共三条描边，
+冒烟里逐条钉住（viewBox / fill / stroke / aria-hidden / 描边条数）。
+
+**为什么不自选现成图标**：运行时图标集是 188 个、`…OutlineMedium` / `…OutlineRegular` 两档，
+里面**没有电脑 / 显示器 / 笔记本**。中间试过让设置页自己选（7 个候选 + 偏好项 + 实时重画），
+用户 2026-10-12 明确不要这种，于是收掉，直接定成自绘的这一台。
+
+**教训（两次白重启换来的）**：磁盘上有**两份** `@deepseek-ai/*` 客户端包 —— 页面真正加载的是
+**asar 里那份**（profile 里同名包的命名与 tree-shaking 范围都不一样，实测 atime 停在安装那天）。
+第一版照着 profile 那份挑了 `IconGaugeOutline16`，真机上根本没这个名字，图标怎么改都不生效。
+所以 `scripts/settings-smoke.mjs` 里那张运行时导出表（282 个名字）是按 **asar 那份**生成的，
+页面用到的每个 `prims.X` 都要在表里 —— 换 dsh 版本后重新生成，别凭 profile 或 README 猜。
 
 ## 轻量（实测数字）
 
@@ -391,7 +486,7 @@ scripts/            install.sh / build_capture.sh（用户向）与 *-smoke、li
   急停三档（环境变量 / 急停文件 / `stop`+`resume`，其中文件档与 `resume` 各起一个独立进程验证跨进程一致）；
   租约仲裁（`CONTROLLER_BUSY` / `force` 抢占 / 死进程回收 / 被抢后拦动作 / 释放）；
   以及动作层契约（每个动作都是 `ActionResult`、签名覆盖工具声明、`on_unchanged` 真的会停、
-  `step_timeout_ms` 真的压住 `_settle`）。wire check 共 131 条断言（`npm run verify` 合计 161 条），其中两组是**一个服务器进程 + 多个逻辑调用者/会话**的多会话拓扑（生产缺陷的忠实复现：从服务器这一侧看，宿主机就是一条 stdio 连接上交替来的两组调用）。
+  `step_timeout_ms` 真的压住 `_settle`）。wire check 共 131 条断言（`npm run verify` 合计 222 条），其中两组是**一个服务器进程 + 多个逻辑调用者/会话**的多会话拓扑（生产缺陷的忠实复现：从服务器这一侧看，宿主机就是一条 stdio 连接上交替来的两组调用）。
   浮窗上那个 ⏹ 的接线（`NSButton.target/action` → `onStop_` → 写/清标志）用一次性脚本验证：
   它要起 NSApplication，所以不进 `npm run check`（会弹窗），只在改动浮窗时手动跑一次。
 - **发布包只装会被加载的东西**（`files` 白名单，`npm pack --dry-run` 可审）：`lib/index.js`
@@ -453,6 +548,15 @@ DSH_ALPHA_HOME="$(pwd)/.dsh-dev" dsh-alpha dev \
   「真炸过」的守则（CF 借用引用必须 retain、滚动单位必须是 Line=1），再用 pyflakes 扫
   `server/*.py`（没装就跳过），专防「函数删了、调用点还留着」—— 预览浮窗和错误分支平时没人
   手动点，这类问题一跑就是 NameError。
+- **路由 handler 只能用「注入后的 scope」，不能碰外层 `ctx` 的服务属性**（2026-10-12 真事故）：
+  本插件的静态 `inject` 是空数组（为了在 tui/headless 里也能挂上身份管线），而 cordis 里访问一个
+  **没注入**的服务属性会抛 `cannot get property "connection" without inject` —— handler 一进来就抛，
+  webserver 把它兜成一个**没有响应体的 400**，用户看到的只有「拿不到电脑操控的状态（HTTP 400）」，
+  连是哪儿抛的都看不出来（`/_computer-use/*` 这几条路由从 `inject: []` 那次重构起就一直是这样，
+  只是卡片退休后再没人调用，直到设置页第一个去调）。规矩：`ctx.inject([...], scope => …)` 拿到的
+  scope 才能读服务（`scope.connection`），或者用免注入的 `ctx.get('name')`；handler 主体另有一层
+  try/catch（`reportRouteError`），异常会回 500 + 原因并写进 `<BASE>/host-error.log`。
+  `scripts/host-smoke.mjs` 的假 ctx 现在照抄 cordis 这条语义（未注入访问就抛），再犯会当场红。
 - **Dock 上不留 Python 图章（自建 UIElement bundle）**：framework 版解释器的主程序在
   `Resources/Python.app` 里，进程一旦和窗口服务器接上，LaunchServices 就按这个 bundle 把进程
   **以及它 spawn 的子进程**（osascript / screencapture / sips / lsappinfo…）登记成一个应用，
@@ -534,7 +638,9 @@ Python 图章」），Dock 上就不会再攒 Python 火箭。这个目录是生
 `DSH_CUA_NO_REEXEC=1` 可以让它整个不换（排障用）。
 
 改完 `server/*.py` / `lib/*.js` 要重启 DeepSeek Harness 生效；只改了 python 侧时，
-杀掉 `server.py` 进程也行 —— mcp-client 会自动重连并读到新代码。
+杀掉 `server.py` 进程也行 —— mcp-client 会自动重连并读到新代码。**客户端半区**
+（`client/settings.js` 或 `package.json` 里的 `dsh.client`）同样要重启：客户端清单在宿主启动时
+扫描并缓存（`pkgMeta` 按 `baseUrl\0loaderName` 记住结论），热替换不会重读它。
 
 ## 配置覆盖
 

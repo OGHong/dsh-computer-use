@@ -1,8 +1,9 @@
 /**
  * 浏览器半区的冒烟检查：真的把「注册 → apply → 挂载 → 渲染组件」跑一遍。
  *
- * 这一半区已**退休**（预览面由 server/preview_window.py 的原生浮窗承担，
- * package.json 里没有 dsh.client 声明，页面不会注入它），实现躺在 retired/preview-card.js。
+ * 这一半区已**退休**（预览面由 server/preview_window.py 的原生浮窗承担），实现躺在
+ * retired/preview-card.js。package.json 里的 `dsh.client` 现在指向**设置页**
+ * （client/settings.js，见 scripts/settings-smoke.mjs），所以页面注入的不是这个卡片。
  * 冒烟仍然保留：把 `dsh.client` 与 `exports["./client"]` 加回去就能复活，行为不能悄悄坏掉。
  *
  * 为什么需要它：`node --check` 只看语法，看不到「用了没声明的名字」（setTick / dragRef /

@@ -7,8 +7,9 @@
 #       command: /usr/bin/python3
 #
 # command/args 必须是**本机插件目录**下的绝对路径（下面两行）：dsh 的 patch 加载只把
-# insert 的 name 解析成文件 URL，config 值原样交给 mcp-client，没有占位符可用。换机器
-# 或换目录之后跑一次 `sh scripts/install.sh`，它会按脚本所在目录改写这两行。
+# insert 的 name 解析成文件 URL，config 值原样交给 mcp-client，没有占位符可用 —— 所以
+# **仓库里这两行是占位符**，跑一次 `sh scripts/install.sh` 会按脚本所在目录把它们改写成
+# 真实路径（README「安装」/「换一台 Mac」两节）。
 # venv 建法见 README（一句话：python3 -m venv .venv &&
 # .venv/bin/pip install -r server/requirements.txt）。
 # 这里指向 venv 的解释器就行 —— 服务器启动时会把自己换进
@@ -31,7 +32,10 @@
         toolCallTimeoutMs: 120000
     # 本插件自身的 Host 半区（lib/index.js，由 src/index.ts 构建而来）：挂
     # /_computer-use/stream、/_computer-use/preview.jpg、/_computer-use/status.json
-    # 三条路由，给预览浮窗与（退休的）内嵌卡片供帧和状态。
+    # 三条路由（给预览浮窗与（退休的）内嵌卡片供帧和状态），外加设置页
+    # （Settings → 电脑操控）用的 settings.json / permissions，以及导航图标补丁的自检上报
+    # nav-icon —— 见 README「设置页」一节。客户端半区是 client/settings.js
+    # （package.json 的 dsh.client）。
     # 它同时负责帧管线（定时器 + SCK 抓屏子进程），这些都挂在 ctx.effect 上，
     # 插件卸载或热替换时一起归还 —— 抓屏进程漏掉会让系统录屏灯一直亮。
     - id: computer-use-host

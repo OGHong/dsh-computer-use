@@ -130,7 +130,58 @@ check("同上：帧再新也照样到点收起（帧只决定「有没有东西�
 
 sig = __import__("inspect").signature(pw._panel_state)
 check("判据函数的输入里没有帧 mtime（结构性保证，不是靠自觉）",
-      list(sig.parameters) == ["now", "agent_ts", "running"], str(list(sig.parameters)))
+      list(sig.parameters) == ["now", "agent_ts", "running", "hide_s"], str(list(sig.parameters)))
+
+# ★ 设置页（Settings → 电脑操控）写进来的偏好：收起延时。
+#   它走 panel.conf（浮窗每拍重读），所以改设置**不需要重启任何进程**。
+def state_conf(quiet, running, hide_s=None):
+    return pw._panel_state(NOW, NOW - quiet, running, hide_s)
+
+
+up, done = state_conf(13.0, False, 60.0)
+check("设置页把收起延时改成 60 秒 → 安静 13 秒还在（默认 12 秒时早收了）",
+      (up, done) == (True, True), f"up={up} done={done}")
+
+up, done = state_conf(61.0, False, 60.0)
+check("同一设置下安静 61 秒才收起", (up, done) == (False, False), f"up={up} done={done}")
+
+up, done = state_conf(pw.DORMANT_S + 1.0, None, 45.0)
+check("拿不到轮次状态时，设置里的延时同样生效（安静 61 秒 > 45 秒 → 收起）",
+      (up, done) == (False, False), f"up={up} done={done}")
+
+# panel.conf：设置页写的偏好镜像。读法必须容错（文件不在 / 坏了 = 全部默认行为），
+# 并且 nonce 语义要对：值没变就不算新指令，否则 250ms 的 tick 会把收起时刻每拍重置。
+pw.CONF.unlink(missing_ok=True)
+pw._conf_cache["value"] = None
+check("没有 panel.conf → 收起延时/收起请求全部走默认",
+      (pw._conf_hide_seconds(), pw._conf_hide_request()) == (None, ("", 0.0)))
+
+pw.CONF.write_text(json.dumps({"autoHideSeconds": 30,
+                               "hideRequest": "hide", "hideRequestAt": 1791734836370}), encoding="utf-8")
+pw._conf_cache["value"] = None
+check("读 panel.conf：收起延时 30 秒", pw._conf_hide_seconds() == 30.0)
+check("读 panel.conf：收起请求带方向与 nonce", pw._conf_hide_request() == ("hide", 1791734836370.0))
+
+pw.CONF.write_text(json.dumps({"autoHideSeconds": 0}), encoding="utf-8")
+pw._conf_cache["value"] = None
+check("收起延时被夹住（0 → 1 秒，别让窗闪一下就没）", pw._conf_hide_seconds() == 1.0)
+
+pw.CONF.write_text("{ 坏 json", encoding="utf-8")
+pw._conf_cache["value"] = None
+check("panel.conf 坏了 → 退回默认（绝不抛）",
+      (pw._conf_hide_seconds(), pw._conf_hide_request()) == (None, ("", 0.0)))
+pw.CONF.unlink(missing_ok=True)
+
+# 粘性 off 不能被 × 覆盖：用户刚在设置页关掉观察窗，随手点一下浮窗的 ×（或下一轮开始时
+# 那次自动解除）不该把它偷偷打开 —— 他会发现「我明明关了它怎么又出来了」。
+pw.HIDDEN.write_text("off:1", encoding="utf-8")
+pw._save_hidden("hide")
+check("×（hide）不会覆盖设置页写的粘性 off", pw.HIDDEN.read_text(encoding="utf-8").startswith("off:"))
+pw._save_hidden("auto")
+check("自动解除（auto）也不会覆盖 off", pw.HIDDEN.read_text(encoding="utf-8").startswith("off:"))
+pw._save_hidden("on")
+check("明确要开（on）可以覆盖 off", pw.HIDDEN.read_text(encoding="utf-8").startswith("on:"))
+pw.HIDDEN.unlink(missing_ok=True)
 
 # panel.state：host 半区据此停流（录屏灯）
 pw.STATE.unlink(missing_ok=True)

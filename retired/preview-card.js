@@ -2,9 +2,11 @@
  * `dsh-computer-use` — the browser half: **已退休的内嵌预览卡片**。
  *
  * 2026-10 用户要求预览面「一直都是浮窗」：能拖到 dsh 窗口之外、浮在别的应用之上，
- * 那是 DOM 做不到的（卡片被窗口裁剪）。所以这一半区不再声明 —— `package.json` 里的
- * `dsh.client` 与 `exports["./client"]` 已撤掉，dsh 不会再把它注入页面；预览面由
+ * 那是 DOM 做不到的（卡片被窗口裁剪）。所以这一半区不再声明，预览面由
  * `server/preview_window.py` 那个原生浮窗承担。
+ *
+ * 注意：`package.json` 里的 `dsh.client` 与 `exports["./client"]` **现在是有的**，
+ * 但指向的是设置页（`client/settings.js`）—— 卡片本身仍然退休，不会被注入页面。
  *
  * 实现完整保留在树里（插件没有版本库，删了就找不回来），但**搬到了 `retired/`**：
  * 它不在 `package.json` 的 `files` 白名单里，所以不再随包发布 —— 发布物里只该有真正

@@ -1,13 +1,17 @@
 {
   "name": "dsh-computer-use",
-  "version": "0.9.0",
-  "description": "让 Agent 看屏幕、动鼠标键盘：内置 computer-use MCP 服务器（截屏/点击/打字/快捷键/滚动/启动应用/带观察的批量动作/急停/控制器租约/绑定令牌/多会话隔离/shell），以 mcp__computer-use__* 工具出现在会话中",
+  "version": "0.10.0",
+  "description": "让 Agent 看屏幕、动鼠标键盘：内置 computer-use MCP 服务器（截屏/点击/打字/快捷键/滚动/启动应用/带观察的批量动作/急停/控制器租约/绑定令牌/多会话隔离/shell），以 mcp__computer-use__* 工具出现在会话中；并在 设置 → 电脑操控 里提供观察窗开关与权限指引",
   "license": "MIT",
+  "author": "OGHong",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
     ".": {
       "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./client/settings.js"
     },
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"
@@ -17,6 +21,7 @@
     "README.md",
     "bin/cua_capture",
     "capture/cua_capture.swift",
+    "client/settings.js",
     "cordis.patch.yml",
     "lib/index.js",
     "scripts/build_capture.sh",
@@ -36,6 +41,13 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-locale"
+      ]
     }
   },
   "keywords": [
@@ -52,10 +64,11 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json",
-    "check": "sh -n scripts/install.sh && sh -n scripts/build_capture.sh && node scripts/client-smoke.mjs && node scripts/host-smoke.mjs && .venv/bin/python scripts/panel-check.py && sh scripts/lint_py.sh && .venv/bin/python scripts/mcp_wire_check.py",
+    "check": "sh -n scripts/install.sh && sh -n scripts/build_capture.sh && node scripts/client-smoke.mjs && node scripts/settings-smoke.mjs && node scripts/host-smoke.mjs && .venv/bin/python scripts/panel-check.py && sh scripts/lint_py.sh && .venv/bin/python scripts/mcp_wire_check.py",
     "verify": "npm run typecheck && npm run build && npm run check",
     "smoke": "node scripts/host-smoke.mjs",
     "smoke:client": "node scripts/client-smoke.mjs",
+    "smoke:settings": "node scripts/settings-smoke.mjs",
     "build:capture": "sh scripts/build_capture.sh",
     "install:local": "sh scripts/install.sh",
     "lint": "sh scripts/lint_py.sh",

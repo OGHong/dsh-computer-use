@@ -18,11 +18,18 @@
  *                                      可中断点（≤0.1s）进入只读；?on=0 或
  *                                      /resume 解除。这是用户侧的第三个入口
  *                                      （另两个是浮窗上的 ⏹ 与 MCP 的 stop 工具）。
+ *   GET /_computer-use/settings.json — 设置页（Settings → 电脑操控）的状态：偏好 +
+ *                                      观察窗运行期状态；POST 同一路径改偏好，落盘到
+ *                                      ~/.dsh/computer-use/settings.json 并镜像进
+ *                                      <BASE>/panel.hidden 与 <BASE>/panel.conf；
+ *   POST /_computer-use/permissions  — 打开系统设置的辅助功能面板（权限卡片上那个按钮）。
  *
  * The observation surface itself is the native floating window
  * (`server/preview_window.py`), which reads the same files; the browser card that
  * used to mount into the page is retired and kept in `retired/preview-card.js`.
- * Nothing in the page is required for the feature to work.
+ * Nothing in the page is required for the feature to work — the one page-level
+ * thing this plugin ships is the **settings section** (`client/settings.js`,
+ * declared as `dsh.client`), and losing it only costs the switches, not the tool.
  *
  * Two rules keep a dsh upgrade from taking the page down with us: mount the route
  * on this plugin's own context inside a try, and degrade to logging when a service
@@ -38,6 +45,8 @@
 import { execFile, spawn } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import { homedir } from 'node:os'
+import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { HostContext, ToolExecution } from './types.js'
 
@@ -150,14 +159,7 @@ function refreshShot(): void {
  * 只能靠它写在 preview.lock 里的 pid 判断 —— 它是推流要不要继续喂的依据。
  */
 function panelAlive(): boolean {
-  try {
-    const pid = Number(readFileSync(`${BASE}/preview.lock`, 'utf8').trim())
-    if (!pid) return false
-    process.kill(pid, 0)
-    return true
-  } catch {
-    return false
-  }
+  return panelPid() > 0
 }
 
 /**
@@ -447,6 +449,405 @@ function frameMtime(): number {
 }
 
 /**
+ * ---- 设置页（Settings → 电脑操控）的偏好与运行时通道 --------------------------
+ *
+ * 用户侧终于有了一个**找得到的开关**。以前「以后别再自动出现」只有 Agent 的
+ * `preview(enable=False)` 能写，而用户侧没有任何恢复入口（README 里那条真事故：随手点一下
+ * 浮窗的 × 就等于打开了一个他再也关不掉的开关）。这一节给设置页两样东西：
+ *
+ *   1. **偏好落盘**（`~/.dsh/computer-use/settings.json`）：`/tmp` 会被系统清掉，
+ *      所以「不再自动出现」必须有一份活过重启的权威副本；
+ *   2. **运行时通道**：把偏好镜像成浮窗与 MCP 服务器**本来就在读**的两个文件 ——
+ *      `panel.hidden`（粘性开关，server.py 认 `off`）与 `panel.conf`（浮窗每拍重读：
+ *      收起延时 / 「这一轮先收起」请求）。于是设置页不需要重启任何进程就生效，
+ *      也不引入第二套只有这个页面认识的状态。
+ *
+ * 谁说了算：`panel.hidden` 是**运行时真相**（Agent 的 preview(False) 也写它），读设置时
+ * 把它折叠回落盘的那份（`reconcileAutoShow`）—— 否则 Agent 关掉之后设置页还显示「开着」，
+ * 重启还会把它复活。
+ */
+
+/** 粘性开关文件：与 server/server.py 的 PANEL_HIDDEN、preview_window.py 的 HIDDEN 同一个。 */
+const HIDDEN = `${BASE}/panel.hidden`
+/** 浮窗每拍读一次的偏好镜像（见 server/preview_window.py 的 `_conf`）。 */
+const CONF = `${BASE}/panel.conf`
+/**
+ * 偏好落盘位置。`DSH_CUA_SETTINGS_DIR` 让冒烟检查跑在隔离目录里 —— 绝不能拿用户的真实
+ * 偏好做断言，更不能把测试写的值留在他机器上。
+ */
+const SETTINGS_FILE = join(
+  process.env.DSH_CUA_SETTINGS_DIR || join(homedir(), '.dsh', 'computer-use'),
+  'settings.json'
+)
+/** 设置页给用户的收起延时选项（秒）；默认 12 秒与浮窗的 DSH_CUA_HIDE_S 对齐。 */
+const AUTO_HIDE_CHOICES = [5, 12, 30, 60, 120]
+const DEFAULT_AUTO_HIDE = 12
+
+/** 设置页能改的两件事（都是「看」的偏好，没有一个会影响 Agent 能不能操作电脑）。 */
+export interface PanelPrefs {
+  /** 以后还自不自动拉起观察窗。false = 粘性关闭，只有设置页或 preview(true) 能解。 */
+  autoShow: boolean
+  /** 这一轮结束、安静这么多秒之后收起观察窗。 */
+  autoHideSeconds: number
+}
+
+const DEFAULT_PREFS: PanelPrefs = { autoShow: true, autoHideSeconds: DEFAULT_AUTO_HIDE }
+
+/** 内存里的当前偏好（第一次读盘后一直用这份；设置页写它就是改它）。 */
+let prefs: PanelPrefs | null = null
+/**
+ * `panel.conf` 里的「这一轮先收起」请求（浮窗据此立刻 orderOut）。
+ *
+ * 唯一的产生者是 `applyAutoShow(false)`：用户把总开关关掉时，光写 `panel.hidden=off` 只能拦住
+ * **以后**的自动拉起，已经开着的那块窗还得让它当场消失。带上毫秒 nonce（值变了才算一条新指令），
+ * 方向固定为 `hide`（`release` 走浮窗自己的语义：下一轮开始自动解除）。
+ */
+let hideRequest: { action: '' | 'hide'; at: number } = { action: '', at: 0 }
+
+/**
+ * 严格递增的 nonce（毫秒）。
+ *
+ * 读侧（浮窗、MCP 服务器）判断「这是不是一条新指令」靠的是**值变了没有**。`Date.now()`
+ * 在同一毫秒里会给出同一个值 —— 两次快速请求就会被读侧当成一条，第二次静默丢失。
+ * 这里保证同一毫秒内的下一次请求也拿到更大的值。
+ */
+let nonce = 0
+function nextNonce(): number {
+  nonce = Math.max(Date.now(), nonce + 1)
+  return nonce
+}
+
+/** 读 `panel.hidden` 的裸值（`off` / `hide` / `on` / `auto` / 空）。 */
+function hiddenValue(): string {
+  try {
+    return readFileSync(HIDDEN, 'utf8').trim().split(':')[0] || ''
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * 写 `panel.hidden`。带毫秒时间戳的 nonce 语义与 server.py / preview_window.py 一致：
+ * 只有值真的变了才算一次新指令。原子写 —— 那两个读侧可能正在读它。
+ */
+function writeHidden(state: 'off' | 'on' | 'hide' | 'auto'): void {
+  try {
+    mkdirSync(BASE, { recursive: true })
+    const tmp = `${HIDDEN}.tmp`
+    writeFileSync(tmp, `${state}:${nextNonce()}`)
+    renameSync(tmp, HIDDEN)
+  } catch (error) {
+    process.stderr.write(`dsh-computer-use: 写 panel.hidden 失败 (${String(error)})\n`)
+  }
+}
+
+/**
+ * 收起延时的合法范围：太小会闪、太大等于没收起，两端都夹住。
+ * 非法值（非数字、null）返回 `null` —— 调用方据此**保留原值**，而不是回落到默认值。
+ */
+function clampSeconds(value: unknown): number | null {
+  if (value === null || value === undefined || typeof value === 'boolean') return null
+  const n = Math.round(Number(value))
+  if (!Number.isFinite(n)) return null
+  return Math.min(Math.max(n, 1), 3600)
+}
+
+/**
+ * 用一份补丁盖在已有偏好上。**坏值保留原值，不回落到默认值** —— 一次带错字段的 POST
+ * 不该把用户其它设置悄悄重置掉（设置页只发它真正改的那个字段）。
+ */
+function mergePrefs(before: PanelPrefs, patch: unknown): PanelPrefs {
+  const raw = (typeof patch === 'object' && patch !== null ? patch : {}) as Record<string, unknown>
+  const seconds =
+    raw.autoHideSeconds === undefined ? before.autoHideSeconds : clampSeconds(raw.autoHideSeconds) ?? before.autoHideSeconds
+  return {
+    autoShow: typeof raw.autoShow === 'boolean' ? raw.autoShow : before.autoShow,
+    autoHideSeconds: seconds
+  }
+}
+
+/** 读落盘的偏好（只读一次）。文件不在 / 坏了 / 字段非法都用默认值，绝不抛。 */
+function loadPrefs(): PanelPrefs {
+  if (prefs) return prefs
+  try {
+    prefs = mergePrefs(DEFAULT_PREFS, JSON.parse(readFileSync(SETTINGS_FILE, 'utf8')))
+  } catch {
+    prefs = { ...DEFAULT_PREFS }
+  }
+  return prefs
+}
+
+/** 落盘（原子写）：设置页改一下就得活过重启，`/tmp` 里的镜像活不过重启。 */
+function savePrefs(): void {
+  const current = loadPrefs()
+  try {
+    mkdirSync(dirname(SETTINGS_FILE), { recursive: true })
+    const tmp = `${SETTINGS_FILE}.tmp`
+    writeFileSync(tmp, JSON.stringify(current, null, 2))
+    renameSync(tmp, SETTINGS_FILE)
+  } catch (error) {
+    process.stderr.write(`dsh-computer-use: 写设置文件失败 (${String(error)})\n`)
+  }
+}
+
+/** 把偏好镜像成浮窗读的那份 conf（原子写；浮窗按 1 秒 TTL 重读）。 */
+function writeConf(): void {
+  const current = loadPrefs()
+  const payload = {
+    autoShow: current.autoShow,
+    autoHideSeconds: current.autoHideSeconds,
+    hideRequest: hideRequest.action,
+    hideRequestAt: hideRequest.at,
+    at: Date.now()
+  }
+  try {
+    mkdirSync(BASE, { recursive: true })
+    const tmp = `${CONF}.tmp`
+    writeFileSync(tmp, JSON.stringify(payload))
+    renameSync(tmp, CONF)
+  } catch (error) {
+    process.stderr.write(`dsh-computer-use: 写 panel.conf 失败 (${String(error)})\n`)
+  }
+}
+
+/**
+ * 把「自不自动出现」落到运行时通道。
+ *
+ * 关掉时要做三件事，缺一件都会留下「我明明关了它怎么还在」的观感：
+ *   1. 写 `panel.hidden=off`（server.py 据此不再自动拉起，粘性，重启后由落盘的偏好续上）；
+ *   2. **结束观察窗进程**（SIGTERM，浮窗自己清 lock 再退出）—— 只写文件的话，已经开着的那块
+ *      窗还留在屏幕上，直到这一轮结束；
+ *   3. 顺手写一次「收起请求」，万一进程没被收掉（权限/异常），它也会立刻从屏上消失。
+ */
+function applyAutoShow(autoShow: boolean): void {
+  if (autoShow) {
+    if (hiddenValue() === 'off') writeHidden('on')
+    return
+  }
+  if (hiddenValue() !== 'off') writeHidden('off')
+  stopPanel()
+  hideRequest = { action: 'hide', at: nextNonce() }
+  writeConf()
+}
+
+/** 结束观察窗进程（SIGTERM：浮窗装了信号处理器，会先清掉 lock 再退出）。 */
+function stopPanel(): boolean {
+  const pid = panelPid()
+  if (!pid) return false
+  try {
+    process.kill(pid, 'SIGTERM')
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** 把运行时真相折叠回落盘的那份偏好（Agent 的 preview(False) 也写 panel.hidden）。 */
+function reconcileAutoShow(): void {
+  const current = loadPrefs()
+  const live = hiddenValue() !== 'off'
+  if (live === current.autoShow) return
+  current.autoShow = live
+  savePrefs()
+}
+
+/** 观察窗进程的 pid（`preview.lock` 里的那个，探活之后才认）。0 = 没起来。 */
+function panelPid(): number {
+  try {
+    const pid = Number(readFileSync(`${BASE}/preview.lock`, 'utf8').trim())
+    if (!pid) return 0
+    process.kill(pid, 0)
+    return pid
+  } catch {
+    return 0
+  }
+}
+
+/** 观察窗的运行期状态：设置页的状态区与冒烟检查都读它。 */
+export function panelStatus(): Record<string, unknown> {
+  const pid = panelPid()
+  let state = ''
+  try {
+    state = readFileSync(`${BASE}/panel.state`, 'utf8').trim().split(':')[0] || ''
+  } catch {
+    /* 老浮窗没有这个文件：那就是「不知道在不在屏上」，按进程活着算 */
+  }
+  const reason = killReason()
+  return {
+    panelPid: pid,
+    panelUp: pid > 0,
+    // 进程活着 + 写着 up = 真的在屏上；读不到 panel.state（老浮窗）时按在屏上算
+    panelVisible: pid > 0 && state !== 'hidden',
+    hidden: hiddenValue(),
+    hideRequest: hideRequest.action,
+    hideRequestAt: hideRequest.at,
+    killed: reason !== '',
+    killReason: reason,
+    lastActionAt: activityMtime(),
+    frameMtime: frameMtime()
+  }
+}
+
+/** 设置页读/写一次都回同一份形状：页面拿到响应直接替换本地状态，不需要二次拉取。 */
+function settingsPayload(): Record<string, unknown> {
+  reconcileAutoShow()
+  const current = loadPrefs()
+  return {
+    settings: { ...current },
+    runtime: panelStatus(),
+    choices: AUTO_HIDE_CHOICES,
+    paths: { settings: SETTINGS_FILE, conf: CONF, base: BASE }
+  }
+}
+
+/** 打开系统设置的辅助功能面板（与 MCP 的 `open_permission_settings` 同一件事）。 */
+function openPermissionSettings(): void {
+  // 冒烟检查/无人环境不该真的弹出一个系统设置窗口：DSH_CUA_NO_OPEN=1 时只留一行日志。
+  if (process.env.DSH_CUA_NO_OPEN === '1') {
+    process.stderr.write('dsh-computer-use: 跳过打开系统设置（DSH_CUA_NO_OPEN=1）\n')
+    return
+  }
+  execFile(
+    'open',
+    ['x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility'],
+    () => {
+      /* 打不开就算了：这只是一条引导，不该让页面报错 */
+    }
+  )
+}
+
+/** 统一回 JSON（这几个端点都是给设置页看的，一律 no-store）。 */
+function respondJson(res: ServerResponse, status: number, payload: unknown): void {
+  const body = JSON.stringify(payload)
+  res.writeHead(status, {
+    'content-type': 'application/json',
+    'cache-control': 'no-store',
+    'content-length': Buffer.byteLength(body)
+  })
+  res.end(body)
+}
+
+/**
+ * 读一个小 JSON 请求体。**封顶 64KB**：这是宿主进程里的路由，一个失控的请求体不该
+ * 把内存吃穿；读不出合法 JSON 就返回 null，由调用方回 400。
+ */
+async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown> | null> {
+  const chunks: Buffer[] = []
+  let size = 0
+  return await new Promise((resolve) => {
+    let settled = false
+    const finish = (value: Record<string, unknown> | null): void => {
+      if (settled) return
+      settled = true
+      resolve(value)
+    }
+    req.on('data', (chunk: Buffer) => {
+      size += chunk.length
+      if (size > 64 * 1024) {
+        finish(null)
+        return
+      }
+      chunks.push(chunk)
+    })
+    req.on('end', () => {
+      try {
+        const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')
+        finish(typeof parsed === 'object' && parsed !== null ? (parsed as Record<string, unknown>) : null)
+      } catch {
+        finish(null)
+      }
+    })
+    req.on('error', () => finish(null))
+  })
+}
+
+/**
+ * 设置页的三个端点（`settings.json` / `panel` / `permissions`）。
+ *
+ * 单独拎出来是因为它们要**异步读请求体**，而路由本身是同步的（`RouteHandler` 返回 void）：
+ * 调用点用 `void` 起这条链，异常在函数内部收口成 500，绝不变成未处理的 rejection。
+ */
+/**
+ * 导航图标补丁的自检日志：追加一行，超过 8KB 就只留尾部 —— 这是个诊断文件，不是账本。
+ * @param line - 已拼好的单行记录（调用方负责截断字段长度）。
+ */
+function appendNavIconLog(line: string): void {
+  const file = `${BASE}/nav-icon.log`
+  try {
+    const previous = existsSync(file) ? readFileSync(file, 'utf8') : ''
+    const next = (previous + line + '\n').slice(-8192)
+    writeFileSync(file, next)
+  } catch (error) {
+    process.stderr.write(`dsh-computer-use: 写 nav-icon.log 失败 (${String(error)})\n`)
+  }
+}
+
+async function handleSettingsRequest(
+  endpoint: string,
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  try {
+    if (endpoint === 'settings.json') {
+      if (req.method === 'GET') {
+        respondJson(res, 200, settingsPayload())
+        return
+      }
+      if (req.method !== 'POST') {
+        respondJson(res, 405, { error: 'method not allowed' })
+        return
+      }
+      const body = await readJsonBody(req)
+      if (body === null) {
+        respondJson(res, 400, { error: 'bad json body' })
+        return
+      }
+      const before = { ...loadPrefs() }
+      prefs = mergePrefs(before, body)
+      savePrefs()
+      // 顺序有讲究：autoShow 变了就走 applyAutoShow（它自己会把收起请求与 conf 一起写对），
+      // 没变才单独镜像一次 conf（收起延时改了也要落到浮窗那边）。
+      if (prefs.autoShow !== before.autoShow) applyAutoShow(prefs.autoShow)
+      else writeConf()
+      respondJson(res, 200, settingsPayload())
+      return
+    }
+    // nav-icon：客户端那个「导航行图标」补丁的自检上报。
+    //
+    // 为什么需要它：平台没给第三方设置页留图标位，图标只能在页面里补（见 client/settings.js 的
+    // installNavIcon），而补丁失败时**页面上什么都看不出来** —— 还是那个兜底齿轮。补不上的原因
+    // （壳改了行高、文案对不上、对话框结构变了……）只有页面自己知道，所以让它写一行到这里：
+    // 用户问「为什么图标还是齿轮」时，答案就在这个文件里。
+    if (endpoint === 'nav-icon') {
+      if (req.method !== 'POST') {
+        respondJson(res, 405, { error: 'method not allowed' })
+        return
+      }
+      const body = await readJsonBody(req)
+      if (body === null) {
+        respondJson(res, 400, { error: 'bad json body' })
+        return
+      }
+      const outcome = String(body.outcome ?? '').slice(0, 40)
+      const detail = String(body.detail ?? '').slice(0, 600)
+      if (outcome) appendNavIconLog(`${new Date().toISOString()} ${outcome} ${detail}`)
+      respondJson(res, 200, { ok: true })
+      return
+    }
+    // permissions：指引区那个「打开辅助功能设置」按钮
+    if (req.method !== 'POST') {
+      respondJson(res, 405, { error: 'method not allowed' })
+      return
+    }
+    openPermissionSettings()
+    respondJson(res, 200, { ok: true })
+  } catch (error) {
+    process.stderr.write(`dsh-computer-use: 设置路由失败 (${String(error)})\n`)
+    respondJson(res, 500, { error: 'internal' })
+  }
+}
+
+/**
  * 有人看 + Agent 在动 → 把帧源起起来（或按目标窗口换掉）。
  *
  * 为什么要有这个函数：起流的调用点原来**只**在 `status.json` 与 `/stream` 两个
@@ -628,8 +1029,221 @@ function shutdown(): void {
  * 挂载这一半区：帧管线（定时器 + 子进程）和预览路由。
  * @param ctx - Host context.
  */
+/**
+ * 路由主体：同步处理一次 `/_computer-use/*` 请求。
+ *
+ * 从 handler 里拆出来，是为了让它整个被 try/catch 包住（见 `reportRouteError`）。
+ * 注意它只接 `scope`：handler 里**绝不能**碰外层 `ctx` 的服务属性（未注入访问会抛），
+ * 这条规则由 scripts/host-smoke.mjs 的假 ctx 钉住。
+ */
+function routeRequest(scope: HostContext, req: IncomingMessage, res: ServerResponse): void {
+
+  // **必须走 `scope`，不能走外层 `ctx`**（这条是真事故，2026-10-12 用户报
+  // 「拿不到电脑操控的状态（HTTP 400）」）：cordis 里访问一个**没注入**的服务属性会抛
+  // `cannot get property "connection" without inject`，而本插件的静态 inject 是空数组
+  // （为了在 tui/headless 里也能挂上身份管线，见文件头那段 inject 说明），于是 handler
+  // 一进来就抛 → webserver 把它兜成一个**没有响应体的 400**（页面只能看到一个裸状态码）。
+  // 只有 `ctx.inject([...], scope => …)` 拿到的 scope 才注入过这两个服务。
+  // 冒烟检查的假 ctx 以前把 connection/webServer 直接挂在外面，所以这条看不见 ——
+  // 现在假 ctx 照抄 cordis 的语义（未注入就抛），这类错误不会再漏出去。
+  const admission = scope.connection.admit(req)
+  const rejection = admission.rejection
+  if (rejection !== undefined) {
+    res.writeHead(rejection)
+    res.end(rejection === 401 ? 'unauthorized' : 'forbidden')
+    return
+  }
+  const endpoint = new URL(req.url ?? '/', 'http://dsh.internal').pathname.slice(
+    CHANNEL.length + 1
+  )
+  // 急停两个端点先于「只允许 GET」的方法检查：它们是控制面，不是取数据。
+  // stop 只做「停」这一个方向（幂等、失败方向安全）；要恢复走 resume
+  // 或 stop?on=0 —— 都不会被一次无意的预取触发成「恢复」。
+  if (endpoint === 'stop' || endpoint === 'resume') {
+    if (req.method !== 'GET' && req.method !== 'POST') {
+      res.writeHead(405, { 'content-type': 'text/plain' })
+      res.end('method not allowed')
+      return
+    }
+    const query = new URL(req.url ?? '/', 'http://dsh.internal').searchParams
+    const on = endpoint === 'resume' ? false : query.get('on') !== '0'
+    const reason = query.get('reason') || '用户从 dsh 页面按了停止'
+    setKill(on, reason)
+    const body = JSON.stringify({ killed: on, reason: on ? reason : '' })
+    res.writeHead(200, {
+      'content-type': 'application/json',
+      'cache-control': 'no-store',
+      'content-length': Buffer.byteLength(body)
+    })
+    res.end(body)
+    return
+  }
+  // 设置页（Settings → 电脑操控）：偏好读写、打开权限面板、导航图标补丁的自检上报。
+  // 它们要异步读请求体，所以单独走一条链；异常在那条链内部收口成 500。
+  if (endpoint === 'settings.json' || endpoint === 'permissions' || endpoint === 'nav-icon') {
+    void handleSettingsRequest(endpoint, req, res)
+    return
+  }
+  if (req.method !== 'GET') {
+    res.writeHead(405, { 'content-type': 'text/plain' })
+    res.end('method not allowed')
+    return
+  }
+  if (endpoint === 'stream') {
+    // MJPEG：Chromium 的 <img> 原生滚帧，省掉轮询、省掉 cache-buster。
+    // 响应故意不 end —— 连接断了（卡片卸载/隐藏）由 close 事件收工。
+    res.writeHead(200, {
+      'content-type': `multipart/x-mixed-replace; boundary=${BOUNDARY}`,
+      'cache-control': 'no-store, max-age=0',
+      connection: 'keep-alive',
+      'x-accel-buffering': 'no'
+    })
+    clients.add(res)
+    lastDemand = Date.now()
+    if (!startCapture() && latestFrame === null) refreshShot()
+    if (latestFrame) {
+      try {
+        res.write(
+          `--${BOUNDARY}\r\ncontent-type: image/jpeg\r\ncontent-length: ${latestFrame.length}\r\n\r\n`
+        )
+        res.write(latestFrame)
+        res.write('\r\n')
+      } catch {
+        clients.delete(res)
+      }
+    }
+    req.on('close', () => clients.delete(res))
+    return
+  }
+  if (endpoint === 'preview.jpg') {
+    if (!existsSync(SHOT)) {
+      res.writeHead(404, { 'content-type': 'text/plain' })
+      res.end('no screenshot yet')
+      return
+    }
+    const body = readFileSync(SHOT)
+    res.writeHead(200, {
+      'content-type': 'image/jpeg',
+      'cache-control': 'no-store',
+      'content-length': body.length
+    })
+    res.end(body)
+    return
+  }
+  if (endpoint === 'status.json') {
+    let action = ''
+    let imageMtime = 0
+    let actionMtime = 0
+    let card = 'on'
+    try {
+      action = readFileSync(`${BASE}/status.txt`, 'utf8').trim()
+      actionMtime = Math.floor(statSync(`${BASE}/status.txt`).mtimeMs)
+    } catch {}
+    try {
+      imageMtime = Math.floor(statSync(`${BASE}/latest.jpg`).mtimeMs)
+    } catch {}
+    // `card.txt` is a retired channel: the browser card that used to write it
+    // (its "collapse me to a pill" state) is gone, so this read can only ever
+    // fail and leave the fail-open default. Kept because the field is part of
+    // status.json's contract — `retired/preview-card.js` and the host smoke
+    // test both still read it — but nothing should treat it as live signal.
+    try {
+      card = readFileSync(`${BASE}/card.txt`, 'utf8').trim() || 'on'
+    } catch {}
+    // 「有没有回合正在跑」由 Host 侧的 agents 服务给出：观察窗的完成态/挂起
+    // 因此跟着真实事件走，而不是靠「N 秒没截图」猜。服务不在就是 unknown（字段
+    // 省略），浏览器半区自会退回时间推断。
+    // `Agent.status` is a real getter on the live agent ('idle' | 'running',
+    // see dsh-agent-loop) even though the service's published `Agent`
+    // interface only declares `id`. Every step of this probe therefore
+    // degrades to "not running": an agent service that is missing, renamed or
+    // reshaped leaves the field out, and the browser half falls back to its
+    // own time-based inference — the safe direction, since the opposite would
+    // show a running badge (and keep a capture stream alive) with no evidence.
+    let agentRunning: boolean | undefined
+    try {
+      // `scope.get` 是 cordis 的**免注入**读法（`ctx.get` 也是），这里跟着上面一起
+      // 用 scope，免得以后有人把 handler 搬回外层 ctx 时又踩一次同样的坑。
+      const listed = scope.get('agents')?.list?.()
+      // 只有真的拿到列表才允许回答。`(list ?? []).some(...)` 会在服务缺失/改名时
+      // 得到 `false` —— 那是「确定没有回合在跑」，与「不知道」是两回事，消费者
+      // （退休卡片/orchestrator）会把这个 false 当成事实。
+      agentRunning = Array.isArray(listed) ? listed.some((a) => a?.status === 'running') : undefined
+    } catch {}
+    const body = JSON.stringify({
+      action,
+      imageMtime,
+      actionMtime,
+      card,
+      killed: killReason() !== '',
+      ...(agentRunning === undefined ? {} : { agentRunning }),
+      now: Date.now()
+    })
+    // 只有卡片真的上了屏（轮询带 view=1）才补帧：隐藏/收起时还每秒抓屏，
+    // 就是白烧 CPU 与磁盘，还会让系统的录屏指示灯一直亮着。
+    // SCK 流在跑时帧本来就新，不必再走 290ms 的 screencapture 老路。
+    const watching = new URL(req.url ?? '/', 'http://dsh.internal').searchParams.get('view') === '1'
+    // 「在用电脑」由动作时间戳说话，不能由「有没有卡片在轮询」说话：卡片可能
+    // 只是因为 dsh 里有普通任务在跑就挂着，那时开录屏等于白开还亮灯。
+    const liveUse = Date.now() - actionMtime <= DORMANT_MS + 10000
+    if (watching && liveUse) lastDemand = Date.now()
+    // 「有人在看」本身就是重启信号：抓屏进程死了（崩溃 / 被 OOM / 手工 kill）时，
+    // 那条 MJPEG 连接还挂着、<img> 卡在 loading 不会自己重连，画面会永久冻死。
+    // 看的人 = 预览浮窗（读 preview.lock 的 pid）或（若还留着卡片实现）带 view=1 的轮询。
+    // helper 起不来才退回 screencapture 那条老路。
+    const demand = liveUse && (panelWatching() || (watching && !card.startsWith('off')))
+    if (demand) pumpFrames(actionMtime)
+    res.writeHead(200, {
+      'content-type': 'application/json',
+      'cache-control': 'no-store',
+      'content-length': Buffer.byteLength(body)
+    })
+    res.end(body)
+    return
+  }
+  res.writeHead(404, { 'content-type': 'text/plain' })
+  res.end('unknown endpoint')
+}
+
+/** 路由异常落点：一行可排查的记录（`<BASE>/host-error.log`）+ 一个能读懂的状态码。 */
+const ROUTE_LOG = `${BASE}/host-error.log`
+
+function reportRouteError(error: unknown, res: ServerResponse): void {
+  const detail = error instanceof Error ? (error.stack ?? error.message) : String(error)
+  try {
+    mkdirSync(BASE, { recursive: true })
+    let previous = ''
+    try {
+      previous = readFileSync(ROUTE_LOG, 'utf8')
+    } catch {
+      /* 第一次失败，没有历史 */
+    }
+    // 只留最后 64KB：这是个排查用的滚雪球文件，不该无限长大
+    writeFileSync(ROUTE_LOG, `${previous}${new Date().toISOString()} ${detail}\n`.slice(-65536))
+  } catch {
+    /* 连日志都写不下去时也不能再抛 —— 那又会变成一个裸 400 */
+  }
+  process.stderr.write(`dsh-computer-use: 路由处理失败 (${detail})\n`)
+  if (!res.headersSent) {
+    res.writeHead(500, { 'content-type': 'text/plain' })
+    res.end(`computer-use route failed: ${detail}`)
+  }
+}
+
 export function apply(ctx: HostContext): void {
   hostCtx = ctx // housekeeping（定时器）要靠它问 agents 服务
+
+  // 设置页的偏好：启动时先把落盘的那份读出来，再把「不再自动出现」重新写回运行时通道 ——
+  // `/tmp/dsh-computer-use` 会被系统清掉，否则用户关掉的开关会在重启后自己复活。
+  // 只强制 off 这一个方向：反向（重新打开）必须由用户或 Agent 明确表达。
+  try {
+    const current = loadPrefs()
+    if (!current.autoShow && hiddenValue() !== 'off') writeHidden('off')
+    writeConf()
+  } catch (error) {
+    process.stderr.write(`dsh-computer-use: 初始化观察窗偏好失败 (${String(error)})\n`)
+  }
+
   // 帧管线：定时器与抓屏子进程都挂在这一次 effect 上，插件卸载即全部归还。
   try {
     ctx.effect(() => {
@@ -661,155 +1275,14 @@ export function apply(ctx: HostContext): void {
           kind: 'prefix',
           path: CHANNEL,
           handler: (req: IncomingMessage, res: ServerResponse) => {
-            const admission = ctx.connection.admit(req)
-            const rejection = admission.rejection
-            if (rejection !== undefined) {
-              res.writeHead(rejection)
-              res.end(rejection === 401 ? 'unauthorized' : 'forbidden')
-              return
+            // 整个路由主体包在 try/catch 里：webserver 对 handler 抛出的异常只有一个动作 ——
+            // 回一个**没有响应体的 400**。没有这层，用户看到的就只有「拿不到电脑操控的状态
+            // （HTTP 400）」，连是哪儿抛的、抛了什么都不知道（2026-10-12 那条事故）。
+            try {
+              routeRequest(scope, req, res)
+            } catch (error) {
+              reportRouteError(error, res)
             }
-            const endpoint = new URL(req.url ?? '/', 'http://dsh.internal').pathname.slice(
-              CHANNEL.length + 1
-            )
-            // 急停两个端点先于「只允许 GET」的方法检查：它们是控制面，不是取数据。
-            // stop 只做「停」这一个方向（幂等、失败方向安全）；要恢复走 resume
-            // 或 stop?on=0 —— 都不会被一次无意的预取触发成「恢复」。
-            if (endpoint === 'stop' || endpoint === 'resume') {
-              if (req.method !== 'GET' && req.method !== 'POST') {
-                res.writeHead(405, { 'content-type': 'text/plain' })
-                res.end('method not allowed')
-                return
-              }
-              const query = new URL(req.url ?? '/', 'http://dsh.internal').searchParams
-              const on = endpoint === 'resume' ? false : query.get('on') !== '0'
-              const reason = query.get('reason') || '用户从 dsh 页面按了停止'
-              setKill(on, reason)
-              const body = JSON.stringify({ killed: on, reason: on ? reason : '' })
-              res.writeHead(200, {
-                'content-type': 'application/json',
-                'cache-control': 'no-store',
-                'content-length': Buffer.byteLength(body)
-              })
-              res.end(body)
-              return
-            }
-            if (req.method !== 'GET') {
-              res.writeHead(405, { 'content-type': 'text/plain' })
-              res.end('method not allowed')
-              return
-            }
-            if (endpoint === 'stream') {
-              // MJPEG：Chromium 的 <img> 原生滚帧，省掉轮询、省掉 cache-buster。
-              // 响应故意不 end —— 连接断了（卡片卸载/隐藏）由 close 事件收工。
-              res.writeHead(200, {
-                'content-type': `multipart/x-mixed-replace; boundary=${BOUNDARY}`,
-                'cache-control': 'no-store, max-age=0',
-                connection: 'keep-alive',
-                'x-accel-buffering': 'no'
-              })
-              clients.add(res)
-              lastDemand = Date.now()
-              if (!startCapture() && latestFrame === null) refreshShot()
-              if (latestFrame) {
-                try {
-                  res.write(
-                    `--${BOUNDARY}\r\ncontent-type: image/jpeg\r\ncontent-length: ${latestFrame.length}\r\n\r\n`
-                  )
-                  res.write(latestFrame)
-                  res.write('\r\n')
-                } catch {
-                  clients.delete(res)
-                }
-              }
-              req.on('close', () => clients.delete(res))
-              return
-            }
-            if (endpoint === 'preview.jpg') {
-              if (!existsSync(SHOT)) {
-                res.writeHead(404, { 'content-type': 'text/plain' })
-                res.end('no screenshot yet')
-                return
-              }
-              const body = readFileSync(SHOT)
-              res.writeHead(200, {
-                'content-type': 'image/jpeg',
-                'cache-control': 'no-store',
-                'content-length': body.length
-              })
-              res.end(body)
-              return
-            }
-            if (endpoint === 'status.json') {
-              let action = ''
-              let imageMtime = 0
-              let actionMtime = 0
-              let card = 'on'
-              try {
-                action = readFileSync(`${BASE}/status.txt`, 'utf8').trim()
-                actionMtime = Math.floor(statSync(`${BASE}/status.txt`).mtimeMs)
-              } catch {}
-              try {
-                imageMtime = Math.floor(statSync(`${BASE}/latest.jpg`).mtimeMs)
-              } catch {}
-              // `card.txt` is a retired channel: the browser card that used to write it
-              // (its "collapse me to a pill" state) is gone, so this read can only ever
-              // fail and leave the fail-open default. Kept because the field is part of
-              // status.json's contract — `retired/preview-card.js` and the host smoke
-              // test both still read it — but nothing should treat it as live signal.
-              try {
-                card = readFileSync(`${BASE}/card.txt`, 'utf8').trim() || 'on'
-              } catch {}
-              // 「有没有回合正在跑」由 Host 侧的 agents 服务给出：观察窗的完成态/挂起
-              // 因此跟着真实事件走，而不是靠「N 秒没截图」猜。服务不在就是 unknown（字段
-              // 省略），浏览器半区自会退回时间推断。
-              // `Agent.status` is a real getter on the live agent ('idle' | 'running',
-              // see dsh-agent-loop) even though the service's published `Agent`
-              // interface only declares `id`. Every step of this probe therefore
-              // degrades to "not running": an agent service that is missing, renamed or
-              // reshaped leaves the field out, and the browser half falls back to its
-              // own time-based inference — the safe direction, since the opposite would
-              // show a running badge (and keep a capture stream alive) with no evidence.
-              let agentRunning: boolean | undefined
-              try {
-                const listed = ctx.get('agents')?.list?.()
-                // 只有真的拿到列表才允许回答。`(list ?? []).some(...)` 会在服务缺失/改名时
-                // 得到 `false` —— 那是「确定没有回合在跑」，与「不知道」是两回事，消费者
-                // （退休卡片/orchestrator）会把这个 false 当成事实。
-                agentRunning = Array.isArray(listed) ? listed.some((a) => a?.status === 'running') : undefined
-              } catch {}
-              const body = JSON.stringify({
-                action,
-                imageMtime,
-                actionMtime,
-                card,
-                killed: killReason() !== '',
-                ...(agentRunning === undefined ? {} : { agentRunning }),
-                now: Date.now()
-              })
-              // 只有卡片真的上了屏（轮询带 view=1）才补帧：隐藏/收起时还每秒抓屏，
-              // 就是白烧 CPU 与磁盘，还会让系统的录屏指示灯一直亮着。
-              // SCK 流在跑时帧本来就新，不必再走 290ms 的 screencapture 老路。
-              const watching = new URL(req.url ?? '/', 'http://dsh.internal').searchParams.get('view') === '1'
-              // 「在用电脑」由动作时间戳说话，不能由「有没有卡片在轮询」说话：卡片可能
-              // 只是因为 dsh 里有普通任务在跑就挂着，那时开录屏等于白开还亮灯。
-              const liveUse = Date.now() - actionMtime <= DORMANT_MS + 10000
-              if (watching && liveUse) lastDemand = Date.now()
-              // 「有人在看」本身就是重启信号：抓屏进程死了（崩溃 / 被 OOM / 手工 kill）时，
-              // 那条 MJPEG 连接还挂着、<img> 卡在 loading 不会自己重连，画面会永久冻死。
-              // 看的人 = 预览浮窗（读 preview.lock 的 pid）或（若还留着卡片实现）带 view=1 的轮询。
-              // helper 起不来才退回 screencapture 那条老路。
-              const demand = liveUse && (panelWatching() || (watching && !card.startsWith('off')))
-              if (demand) pumpFrames(actionMtime)
-              res.writeHead(200, {
-                'content-type': 'application/json',
-                'cache-control': 'no-store',
-                'content-length': Buffer.byteLength(body)
-              })
-              res.end(body)
-              return
-            }
-            res.writeHead(404, { 'content-type': 'text/plain' })
-            res.end('unknown endpoint')
           }
           }),
         'computer-use: preview routes'
