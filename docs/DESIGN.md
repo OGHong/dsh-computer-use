@@ -63,7 +63,7 @@ TypeError）；`sequence` 的**内层** args 走同一个转换（SDK 的校验�
 另有：`list_windows`（全局窗口清单含 window_id）、`launch_app`（启动并验证进程存活）、
 `run_shell`（60 秒强杀 + 防呆提示）、`screen_info`（显示器 + 权限 + 急停 + 租约状态自查）、
 `open_permission_settings`、`preview`（预览浮窗开关；显示时会把浮窗、× 与 ⏹ 的坐标一起报出来）、
-`stop` / `resume` / `release_lease`（控制面）。共 **28 个工具**；`get_ax_state(screenshot=true)`
+`stop` / `resume` / `release_lease`（控制面）。共 **29 个工具**；`get_ax_state(screenshot=true)`
 一次拿「元素树 + 一张图」，`get_app(focus=true)` 绑定并带到前台。
 
 ## 一轮多步 · 防重放 · 急停 · 租约（v2）
@@ -141,6 +141,95 @@ TypeError）；`sequence` 的**内层** args 走同一个转换（SDK 的校验�
 模块最不能出的错。目标不同的会话仍然放行，只在结果里带一句「另一个会话正在操作 X，会互相抢前台」。
 **用户接管检测**是启发式的：记住我们上一次动作落下的光标位置，下一次动作前发现它自己动过
 （>12pt 且间隔 >0.7 秒）就在结果里提示「可能用户正在接管，先停下来问他」——只提示、不阻断。
+
+## 代码执行层（v3 · `run_code`）
+
+取舍与验收标准写在 `computer-use-v3-设计任务书.md`；这里只记结论与实现。
+
+`sequence` 是**声明式步骤表**：能省回合，但省不掉「第 3 步该不该走」的那次模型调用 —— 步骤在
+调用之前就写死了。`run_code` 补的是另一类任务：步数取决于运行结果（「29 条记录里哪几条状态
+要改」），需要循环 / 条件 / 校验。分工写进了 `mcp.instructions`：≤5 步、步骤固定、无分支用
+`sequence`；一段脚本里动作超过约 8 个、或要按数据分支用 `run_code`。
+
+**接口**（`server/code_exec.py`）：
+
+```
+run_code(code, *, binding_id="", dry_run=False, allow_shell=False,
+         wall_timeout_ms=20000, max_actions=50, max_observations=10,
+         step_timeout_ms=5000, detail="compact")
+```
+
+`mu` 的属性**只**从 `_ACTIONS` 投影（`_CODE_API = {n: s.fn ...}`，排除 `run_code` 与
+`stop` / `resume` / `preview` / `release_lease`），没有第二份名字表；调用时走与 `sequence`
+同一条 `coerce_for` 转换。`run_shell` 默认**不在** `mu` 上，只有 `allow_shell=true` 才注入
+（属性不存在是 AttributeError 级拒绝，不是运行时报错）。可以直接 `print()`；`mu.done(value)`
+设置最终结果（`repr` 截断 500 字符）；`mu.log(...)` 等价 `print`。
+
+返回值一律是 dict：`ok / effect / evidence / settle_ms / possibly_sent / error / message /
+detail`，`detail` 只保留 `hint / notice / hints`。观察类（`get_ax_state` / `elements`）默认
+`compact`：`total / returned / nodes（前 60 行）/ truncated`，截断时带一句「要全量用
+`run_code(detail="full")`」；`detail="full"` 时原样透传（上限 16000 字节，附录允许实现方自定）。
+`screenshot` 返回 `ok / path / size_px / display`，**绝不回 base64**。`list_apps` /
+`list_windows` / `get_app` / `run_shell` 的主数据（apps、windows、binding_id、stdout/exit …）
+以顶层字段返回 —— 它们正是脚本要按数据分支时需要的，`detail` 仍然只放提示。
+
+**不变量**（与 v2 同一套，不另建）：
+
+- **账本永不丢**：每次 `mu.*` 调用都进 `records`，`except BaseException` 路径也记，且用现成的
+  `action_layer.was_sent()`，不另建「发出去了吗」的记账；中途失败时头行写清「第几步之后停止、
+  已执行几步」，账本原样列出——那就是**实际已经发生**的副作用清单。
+- **防重放抬到整批**：任一步 `possibly_sent=true` 立刻停止整段脚本，外层显式回
+  `possibly_sent=true` 并附 `action_layer.POSSIBLY_SENT`。这里有个必踩的坑：`action.action()`
+  的 `run()` 每次进入都会把 `_sent[0]` 重置，嵌套调用的会重置外层；所以整批的
+  `possibly_sent` 是从账本算出来再**显式赋值**的，不靠装饰器兜底。
+- **绑定与索引**：入口先 `check_binding` 一次（不过就 0 步下发）；之后每个带 `binding_id` 的
+  内层调用自动补上顶层令牌，让每步再自检一遍。观察之后旧索引全部作废，头行/提示沿用 sequence
+  的措辞。
+- **预算**：`signal.setitimer(ITIMER_REAL, wall_timeout_ms/1000)` 硬墙钟；`max_actions` 计
+  `risk=true` 的调用、`max_observations` 计 `read_only=true` 的调用；`step_timeout_ms` 通过
+  `_SETTLE_BUDGET_MS` 压住内层 settle。定时器、handler、settle 预算全部在 `finally` 里复位
+  ——这个进程是宿主级单例，漏一次就会打歪下一个请求。
+- **一次最多一张图**：脚本里截图 / 带图观察多次，只把**最后一张**附在工具结果里，文本说明
+  「非末步的 observe 不附图：一次结果最多一张栅格图」。
+- **取消**：每个内层注入调用入口调一次 `mcp_stdio.pause(0)`；纯 CPU 脚本由墙钟兜住。
+
+**静态预检**（执行前，`dry_run=true` 只做这一节）：`ast.parse` 之后按白名单拒
+`import`（只允许 `json / re / math / itertools / collections / textwrap`）、`_DENY_NAMES`
+（`open` / `eval` / `exec` / `getattr` / `__import__` …）、双下划线属性、`global` /
+`nonlocal`、`async` / `await`、覆盖 `mu` / `print` 的赋值，以及 `mu.<name>` 不在 `_CODE_API`
+的名字。`while True` 没有能退出本层的 `break` 只提示、不阻断（交给墙钟）。
+
+**错误码**（一律不落 `INTERNAL`）：
+
+| 码 | 触发 |
+|---|---|
+| `SCRIPT_SYNTAX` | 语法错，消息带 `line N` |
+| `SCRIPT_FORBIDDEN` | 命中禁用语法/名字，消息带行号与被禁名字 |
+| `SCRIPT_UNKNOWN_ACTION` | `mu.<name>` 不在 `_CODE_API`，消息列出可用名（排序） |
+| `SCRIPT_ARGUMENT` | 内层调用缺参 / 多参 / 类型转换失败，消息带合法参数表（`inspect.signature`） |
+| `SCRIPT_ERROR` | 脚本自己抛异常，消息带 `line N: <ExcType>: <msg>` + 只保留用户脚本帧（≤8 行） |
+| `SCRIPT_TIMEOUT` / `SCRIPT_BUDGET` | 超墙钟 / 超动作或观察数 |
+
+**边界声明（原文，不许美化）**：
+
+> `run_code` 的受限执行**不是安全边界**。in-process `exec` 在 CPython 里可以被走过（经典 `().__class__.__base__.__subclasses__()` 路径），`__` 属性拦截只提高门槛。它挡的是手滑与幻觉；而"让模型在这台机器上跑任意命令"这个能力本来就由 `run_shell` 这个独立工具承载，所以不构成提权。要真隔离只有子进程一条路（§7）。
+
+**为什么超时异常必须继承 `BaseException`**：`action()` 装饰器里有 `except Exception as e: →
+INTERNAL`。若超时异常是 `Exception` 子类，定时器在某个内层动作里触发时就会被 `@action` 吞掉、
+变成一个 `INTERNAL` 的 `ActionResult`，**脚本继续跑完**，墙钟形同虚设。所以
+`ScriptHalt(BaseException)`，与既有的 `killswitch.Killed`（`killswitch.py:39`）、
+`mcp_stdio.Cancelled`（`mcp_stdio.py:37`）同类——动作路径里有大量 `except Exception` 兜底分支，
+而超时是控制流、不是工具错误。信号处理器里只做 `raise`，不做 IO；`run_code` 自己的
+`try/except ScriptHalt` 是唯一捕获点，内层那个 `except BaseException` 只记账、原样抛回。
+
+**`allow_shell`** 是 v3 实现补进签名的一个参数（任务书 §3.2 要求「默认不在 mu 上、只有
+`allow_shell=True` 才注入」，但 §3.1 的签名列表漏了它；A12 要求验证该行为）。默认为 false。
+同理，`AttributeError` 在受限 builtins 里（文档给出的 `except AttributeError` 检测方式必须可用），
+但**故意不放 `BaseException`** —— `ScriptHalt` 靠它不可被脚本的 `except Exception` 吞掉。
+
+**`sequence` 嵌套 `run_code`**：`run_code` 注册进 `_ACTIONS` 后自然成为 sequence 的一步；
+内层的墙钟/预算在内部生效，超时会作为这一步的失败返回，外层 sequence 的副作用清单仍完整
+（wire check 有一条断言钉住）。任务书没有规定这条组合，记录在这里作为附加能力。
 
 ## 多会话：一个 DSH 实例里的多个会话
 
@@ -226,7 +315,7 @@ agent 作用域还允许复用同名 `serverName`（`dsh-mcp-client/lib/index.js
   实现搬到 `retired/`），要用就得把它加回来并按 tools/list 逐工具注册 zh/en 双标题；审批横幅走的仍是
   raw 名，host 半区没有任何改名/改展示名的事件可用（`tools/pre-execute` 等全在执行层）。
 
-结论：**记为已知限制，不做**。真要做，最小可行动作 = 复活 client 半区 + 28 条 keyed slot 注册；
+结论：**记为已知限制，不做**。真要做，最小可行动作 = 复活 client 半区 + 29 条 keyed slot 注册；
 更彻底的做法要改 DSH 本体（让 mcp-client 透传 MCP `title`，client 通用卡优先使用它）。
 
 **预览面只有一个：OS 级浮窗**（`server/preview_window.py`，原生 NSPanel，对齐 ZCode / Qoder
@@ -485,7 +574,8 @@ scripts/            install.sh / build_capture.sh（用户向）与 *-smoke、li
   时一起归还 —— 抓屏进程活下来不只是漏一个进程，它会让系统录屏灯一直亮着。host-smoke 里有一条
   断言直接盯着「已经打开的 MJPEG 连接有没有被收掉」。
 - `npm run check` = `client-smoke`（退休卡片）、`host-smoke`、`lint_py.sh`、
-  `mcp_wire_check.py`（对着真实 stdio 逐字段对拍协议面）。所有测试都跑在隔离目录
+  `mcp_wire_check.py`（对着真实 stdio 逐字段对拍协议面）、`check_pack.py`（从
+  `npm pack` 产物解压出来起服务器，验 29 个工具与 `files` 白名单覆盖全部 `server/*.py`）。所有测试都跑在隔离目录
   （`DSH_CUA_DIR=/tmp/dsh-cua-smoke.<pid>`、wire check 用 `/tmp/dsh-cua-wire.<pid>` 并在结束时删掉）/
   独立子进程里，自带夹具，不读真实现场、不写 `~/.dsh`。
 - **wire check 现在覆盖 v2 的每条新语义，且全部不碰真实输入**（挑的都是「本来就会报错」的分支）：
@@ -494,14 +584,16 @@ scripts/            install.sh / build_capture.sh（用户向）与 *-smoke、li
   急停三档（环境变量 / 急停文件 / `stop`+`resume`，其中文件档与 `resume` 各起一个独立进程验证跨进程一致）；
   租约仲裁（`CONTROLLER_BUSY` / `force` 抢占 / 死进程回收 / 被抢后拦动作 / 释放）；
   以及动作层契约（每个动作都是 `ActionResult`、签名覆盖工具声明、`on_unchanged` 真的会停、
-  `step_timeout_ms` 真的压住 `_settle`）。wire check 共 131 条断言（`npm run verify` 合计 222 条），其中两组是**一个服务器进程 + 多个逻辑调用者/会话**的多会话拓扑（生产缺陷的忠实复现：从服务器这一侧看，宿主机就是一条 stdio 连接上交替来的两组调用）。
+  `step_timeout_ms` 真的压住 `_settle`）。wire check 共 167 条断言（`npm run verify` 合计 263 条，含 `check_pack.py` 的 5 条打包断言），其中两组是**一个服务器进程 + 多个逻辑调用者/会话**的多会话拓扑（生产缺陷的忠实复现：从服务器这一侧看，宿主机就是一条 stdio 连接上交替来的两组调用）。
   浮窗上那个 ⏹ 的接线（`NSButton.target/action` → `onStop_` → 写/清标志）用一次性脚本验证：
   它要起 NSApplication，所以不进 `npm run check`（会弹窗），只在改动浮窗时手动跑一次。
 - **发布包只装会被加载的东西**（`files` 白名单，`npm pack --dry-run` 可审）：`lib/index.js`
-  与 `server/*.py`、抓屏 helper、两个用户向脚本、`cordis.patch.yml`、README/LICENSE —— 共 20 个
-  文件。`src/`、`retired/`、`scripts/*-smoke.mjs`、`scripts/mcp_wire_check.py`、
+  与 `server/*.py`、抓屏 helper、两个用户向脚本、`cordis.patch.yml`、README/LICENSE —— 共 25 个
+  文件（含 `package.json`、`docs/` 与 `client/settings.js`）。`src/`、`retired/`、
+  `scripts/*-smoke.mjs`、`scripts/mcp_wire_check.py`、`scripts/check_pack.py`、
   `scripts/lint_py.sh`、`runtime/`、`.venv/` 都不进包，所以 `npm run check` / `verify`
-  要在源码树里跑。
+  要在源码树里跑。`check_pack.py` 会反过来断言：仓库里 `server/*.py` 的每一个都必须在打包
+  列表里，防止下一个新模块漏进 `files`（D7 的发版阻塞就是这样来的）。
 - `mcp_wire_check.py` 末尾还有一段**进程内**回归闸门（拿真实 `tools/list` 的 schema 与 `sequence`
   内层签名逐个对拍，以及断言落点保护在窗口列表读不到时**拒绝**而不是放行）—— 这两类漂移都不会
   报错，只会静默失效，所以必须由断言盯着。计时一律用 `time.monotonic()`：墙钟在机器休眠时会跳，

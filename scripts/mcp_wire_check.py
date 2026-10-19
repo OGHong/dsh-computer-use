@@ -2,7 +2,7 @@
 """真的用 stdio 跟工具服务器握一次手 —— 手写协议层最怕的就是「看着对、发出去不对」。
 
 覆盖：initialize（回显 protocolVersion / capabilities 形状 / serverInfo）、
-notifications 不该有回包、tools/list 的 28 个工具与每个工具的 name/description/inputSchema、
+notifications 不该有回包、tools/list 的 29 个工具与每个工具的 name/description/inputSchema、
 tools/call 的文本与图片两种 content、缺参数、未知方法、ping、参数类型转换、
 以及三条生命周期：Dock 上不留图章、宿主断开后不滞留、notifications/cancelled 真的打断动作且不回包。
 
@@ -13,6 +13,12 @@ v2 新增（设计任务书 §3.1~§3.6，全部**不发真实输入**）：
   - 急停三档：环境变量 / 急停文件（= 浮窗 ⏹ 与 host 路由走的那条）/ stop-resume 工具；
   - 控制器租约：并发申请 CONTROLLER_BUSY、force 抢占、持有者崩溃后自动回收、退出自动释放；
   - 动作层契约：每个注册动作都是 ActionResult、渲染层不返回自然语言对象。
+
+v3 新增（设计任务书 §8/§9，全部**不发送输入**）：
+  - run_code 预检三码（语法 / 禁用名字 / 未知动作名）；
+  - 账本在异常路径完整、possibly_sent 按整批计算、超时不被 @action 吞掉；
+  - 纯 CPU 墙钟、观察 compact 投影、单图、绑定令牌零下发、run_shell 默认不存在；
+  - step_timeout_ms 结束后复位、code_exec 无第三方依赖。
 """
 import inspect
 import json
@@ -25,7 +31,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SERVER = ROOT / "server" / "server.py"
-GOLDEN_TOOLS = 28
+GOLDEN_TOOLS = 29
 #: 这个检查会真的跑起服务器：给它一个自己的目录，别碰真实会话的 state
 CHECK_DIR = Path(os.environ.get("DSH_CUA_CHECK_DIR") or f"/tmp/dsh-cua-wire.{os.getpid()}")
 
@@ -90,6 +96,12 @@ def main() -> int:
     check("protocolVersion 回显客户端版本", r.get("protocolVersion") == "2024-11-05")
     check("capabilities 齐备", sorted(r.get("capabilities", {})) == ["experimental", "prompts", "resources", "tools"])
     check("serverInfo.name", r.get("serverInfo", {}).get("name") == "computer-use")
+    instructions = r.get("instructions", "")
+    check("mcp.instructions 写清 sequence vs run_code 的分工",
+          "run_code" in instructions and "sequence" in instructions and "≤5 步" in instructions,
+          [ln for ln in instructions.split("程序化批处理")[1:2]][0][:70] if "程序化批处理" in instructions else instructions[:60])
+    check("mcp.instructions 不把 run_code 描述成沙箱/隔离环境",
+          not any(w in instructions for w in ("沙箱", "sandbox", "隔离", "受限执行")))
 
     send({"jsonrpc": "2.0", "method": "notifications/initialized"})
     time.sleep(0.2)
@@ -105,6 +117,18 @@ def main() -> int:
     check("必填参数被标出（click.x/y）", click["inputSchema"].get("required") == ["x", "y"], str(click["inputSchema"].get("required")))
     check("可选参数带默认值（screenshot.display=1）",
           next(t for t in tools if t["name"] == "screenshot")["inputSchema"]["properties"]["display"].get("default") == 1)
+    run_tool = next(t for t in tools if t["name"] == "run_code")
+    run_props = run_tool["inputSchema"]["properties"]
+    check("run_code 的 inputSchema 与实现签名一致（9 个参数，接口名照任务书）",
+          set(run_props) == {"code", "binding_id", "dry_run", "allow_shell", "wall_timeout_ms",
+                             "max_actions", "max_observations", "step_timeout_ms", "detail"},
+          str(sorted(run_props)))
+    check("run_code 必填只有 code", run_tool["inputSchema"].get("required") == ["code"],
+          str(run_tool["inputSchema"].get("required")))
+    check("run_code 描述写明 allow_shell 默认关、dry_run 可预检，且没有沙箱话术",
+          "allow_shell" in run_tool["description"] and "dry_run" in run_tool["description"]
+          and not any(w in run_tool["description"] for w in ("沙箱", "sandbox", "隔离", "受限执行")),
+          run_tool["description"][:80])
 
     info = recv_call(send, recv, "screen_info", {})
     check("tools/call 文本结果", info["content"][0]["type"] == "text" and "主屏逻辑尺寸" in info["content"][0]["text"],
@@ -159,6 +183,12 @@ def main() -> int:
     def call_text(name, arguments):
         res = recv_call(send, recv, name, arguments)
         return "".join(b.get("text", "") for b in res.get("content") or []), res
+
+    def call_code(code, **kwargs):
+        res = recv_call(send, recv, "run_code", {"code": code, **kwargs})
+        text = "".join(b.get("text", "") for b in res.get("content") or [] if b.get("type") == "text")
+        images = [b for b in res.get("content") or [] if b.get("type") == "image"]
+        return text, images
 
     windows = json.dumps(recv_call(send, recv, "list_windows", {}), ensure_ascii=False)
     check("list_windows 在真机上走通（只读）", "ERROR[" not in windows, windows[:70])
@@ -299,8 +329,7 @@ def main() -> int:
         b_a2 = binding_of(a_txt)
         call_text("get_ax_state", {"full": True})
         as_session("session-BBB")
-        b_txt2, _ = call_text("get_app", {"app": pids2[1]})
-        b_b2 = binding_of(b_txt2)
+        call_text("get_app", {"app": pids2[1]})
         call_text("get_ax_state", {"full": True})
         # §5.1-1 并发绑定隔离：A 再观察，拿到的必须还是 A 那个应用的树
         as_session("session-AAA")
@@ -345,6 +374,122 @@ def main() -> int:
         check("删掉 caller.json 之后这次调用回落到共享桶（身份没了就退回旧行为，不炸）",
               "当前调用属于 shared" in shared_again,
               [ln for ln in shared_again.splitlines() if "会话身份" in ln][0][:80])
+
+    # --- run_code v3（任务书 §8/§9；全部不发送输入） --------------------------------
+    dry_ok, _ = call_code("mu.list_apps()\nmu.get_ax_state(full=True)\n", dry_run=True)
+    check("run_code dry_run 只做预检、不碰电脑（动作/观察计数正确）",
+          "预检通过" in dry_ok and "动作 0 个、观察 2 次" in dry_ok, dry_ok[:80])
+
+    syn, _ = call_code("def f(:\n    pass\n", dry_run=True)
+    check("SCRIPT_SYNTAX 命中且带行号", "ERROR[SCRIPT_SYNTAX]" in syn and "line 1" in syn, syn[:90])
+    forb, _ = call_code('open("/tmp/x")\n', dry_run=True)
+    check("SCRIPT_FORBIDDEN 命中且带行号 + 被禁名字",
+          "ERROR[SCRIPT_FORBIDDEN]" in forb and "line 1" in forb and "open" in forb, forb[:90])
+    unk, _ = call_code("mu.click_elment(index=1)\n", dry_run=True)
+    check("SCRIPT_UNKNOWN_ACTION 命中且列出可用名",
+          "ERROR[SCRIPT_UNKNOWN_ACTION]" in unk and "line 1" in unk
+          and "mu.click_elment" in unk and "可用：" in unk, unk[:110])
+
+    ledger, _ = call_code("mu.list_apps()\nmu.list_apps()\nmu.get_ax_state(max_nodes='abc')\n")
+    check("账本在异常路径也完整（3 条、含错误码、头行已执行 2 步）",
+          "已执行 2 步" in ledger and "1. [list_apps]" in ledger and "2. [list_apps]" in ledger
+          and "3. [get_ax_state]" in ledger and "ERROR[SCRIPT_ARGUMENT]" in ledger,
+          ledger.splitlines()[0][:110] if ledger else "")
+    check("SCRIPT_ARGUMENT 报出合法参数表（缺参/多参绝不静默丢弃）",
+          "合法参数" in ledger and "max_nodes" in ledger, ledger[-300:])
+
+    binding_bad, _ = call_code("mu.list_apps()\n", binding_id="bogus")
+    check("绑定令牌带错 → BINDING_CHANGED 且账本为空（一步都没下发）",
+          "ERROR[BINDING_CHANGED]" in binding_bad and "账本为空" in binding_bad
+          and "0 步" in binding_bad and "[list_apps]" not in binding_bad, binding_bad[:110])
+
+    shell_off, _ = call_code('mu.run_shell("id")\n')
+    check("allow_shell=False 时 mu.run_shell 根本不存在（AttributeError，不是执行 shell）",
+          "AttributeError" in shell_off and "allow_shell" in shell_off and "uid=" not in shell_off,
+          shell_off.splitlines()[0][:110] if shell_off else "")
+    shell_caught, _ = call_code(
+        'try:\n    mu.run_shell("id")\nexcept AttributeError:\n    mu.done("caught")\n'
+    )
+    caught_line = next((ln for ln in shell_caught.splitlines() if "caught" in ln), "") if shell_caught else ""
+    check("AttributeError 在白名单里（文档给出的 except AttributeError 检测方式真的可用）",
+          "SCRIPT_ERROR" not in shell_caught and "caught" in shell_caught and "uid=" not in shell_caught,
+          caught_line or shell_caught[-120:])
+
+    cpu_started = time.monotonic()
+    cpu, _ = call_code("while True:\n    pass\n", wall_timeout_ms=1000)
+    cpu_ms = int((time.monotonic() - cpu_started) * 1000)
+    check("纯 CPU 死循环被墙钟硬停（SCRIPT_TIMEOUT，不是 INTERNAL）",
+          "ERROR[SCRIPT_TIMEOUT]" in cpu and "INTERNAL" not in cpu and cpu_ms < 5000, f"{cpu_ms}ms")
+    after_cpu, _ = call_code("mu.list_apps()\n", dry_run=True)
+    check("墙钟超时之后仍能服务下一个请求（定时器与 handler 已复位）",
+          "预检通过" in after_cpu, after_cpu[:60])
+
+    mutex, _ = call_code("mu.wait(seconds=5)\n", wall_timeout_ms=1500)
+    check("墙钟在动作中间触发 → SCRIPT_TIMEOUT（异常没有被 @action 吞成 INTERNAL）",
+          "ERROR[SCRIPT_TIMEOUT]" in mutex and "INTERNAL" not in mutex, mutex.splitlines()[0][:110])
+    check("超时的那一步也在账本里（wait 记录 + SCRIPT_TIMEOUT）",
+          "1. [wait]" in mutex and "SCRIPT_TIMEOUT" in mutex.split("--- 账本 ---")[-1],
+          mutex.split("--- 账本 ---")[-1][:90])
+
+    obs, _ = call_code(
+        "r = mu.get_ax_state(full=True)\n"
+        "print('OBS', r.get('total'), r.get('returned'), r.get('truncated'), len(r.get('nodes') or []))\n"
+        "print('HINT', r.get('hint') or '')\n"
+    )
+    obs_m = _re.search(r"OBS (\d+) (\d+) (True|False) (\d+)", obs)
+    if not obs_m or int(obs_m.group(1)) <= 60:
+        skip("观察 compact 投影（total/returned/truncated）", "当前前台应用不足 60 个元素或没有可观察应用")
+    else:
+        total_n, returned_n = int(obs_m.group(1)), int(obs_m.group(2))
+        kept = int(obs_m.group(4))
+        check("detail=compact 时观察有 total/returned/truncated，且只回 60 行",
+              obs_m.group(3) == "True" and returned_n == 60 and kept == 60 and total_n >= 60,
+              f"{returned_n}/{total_n}, kept={kept}, truncated={obs_m.group(3)}")
+        check("compact 结果带「要全量用 detail=full」的提示",
+              'detail="full"' in obs and "前 60 行" in obs, obs[obs.find("HINT"):][:90])
+
+    shots, shots_imgs = call_code("mu.screenshot()\nmu.screenshot()\nmu.screenshot()\n")
+    if not shots_imgs and ("PERMISSION_DENIED" in shots or "INVALID_ARGUMENT" in shots or "共 0 个" in shots):
+        skip("单图（脚本内截图 3 次只附 1 张）", "当前没有可截取的显示器或屏幕录制权限")
+    else:
+        check("脚本内截图 3 次 → content 里恰好 1 个 image 块",
+              len(shots_imgs) == 1, f"images={len(shots_imgs)}")
+        check("文本说明只附最后一张（一次结果最多一张栅格图）",
+              "一次结果最多一张栅格图" in shots, shots[-160:])
+
+    ps, _ = call_code(
+        'mu.launch_app("DSH-CUA-NoSuchApp-XYZ")\n'
+        "mu.list_apps()\n"
+        'mu.done("unreachable")\n',
+        wall_timeout_ms=15000,
+    )
+    check("整批防重放：第 1 步 possibly_sent 后立刻停止，第 2 步与 mu.done 都没跑",
+          "possibly_sent=true" in ps and "1. [launch_app]" in ps
+          and "2. [list_apps]" not in ps and "unreachable" not in ps,
+          ps.splitlines()[0][:110] if ps else "")
+    check("整体 possibly_sent 为 true，并带 action_layer.POSSIBLY_SENT 指引",
+          ps.count("possibly_sent=true") >= 2 and "不要重复同一动作" in ps, ps[-220:])
+
+    nested, _ = call_text("sequence", {
+        "steps": [{"tool": "run_code", "args": {"code": "mu.wait(seconds=5)\n",
+                                                "wall_timeout_ms": 1000}}],
+        "sequence_timeout_ms": 10000,
+    })
+    check("sequence 可以嵌套 run_code：内层超时被包住、外层副作用清单完整、无协议错误",
+          "sequence 在第 1 步停止" in nested and "[run_code]" in nested
+          and "SCRIPT_TIMEOUT" in nested and "实际已经发生" in nested,
+          nested[:180].replace("\n", " | "))
+
+    stopped = call_text("stop", {"reason": "wire-check run_code"})[0]
+    check("急停已生效（为 run_code 的 A11 做准备）",
+          "已进入只读" in stopped and "急停" in stopped, stopped[:70])
+    killed_code, _ = call_code("mu.list_apps()\n")
+    check("急停期间 run_code 返回 ERROR[KILLED]",
+          "ERROR[KILLED]" in killed_code, killed_code.splitlines()[0][:100] if killed_code else "")
+    still_observes, _ = call_text("get_ax_state", {})
+    check("急停期间观察类工具仍可用（get_ax_state 不被 KILLED）",
+          "KILLED" not in still_observes, still_observes[:80])
+    call_text("resume", {})
 
     # 主连接到这里就功成身退：下面的生命周期检查各用独立进程（Dock 图章要新进程，
     # 断连要能关掉一条连接的 stdin）。**之后不要再往 send/recv 上加检查**——它们会读到
@@ -498,6 +643,17 @@ def main() -> int:
         dropped = declared - set(inspect.signature(spec.fn).parameters)
         check(f"动作 {name} 的形参覆盖工具声明（否则参数被静默丢弃）", not dropped,
               f"会被丢弃: {sorted(dropped)}")
+    run_declared = set(next(t for t in tools if t["name"] == "run_code")["inputSchema"]["properties"])
+    run_sig = set(inspect.signature(server_mod._ACTIONS["run_code"].fn).parameters)
+    check("run_code 的 inputSchema 与实现签名逐个一致（双向）", run_declared == run_sig,
+          f"多余声明={run_declared - run_sig} 未声明={run_sig - run_declared}")
+
+    sent_algo = server_mod.code_exec._batch_possibly_sent
+    check("整批 possibly_sent 从账本算：第一条 true、最后一条 false 仍为 true（不取最后一次内层调用）",
+          sent_algo([{"possibly_sent": True}, {"possibly_sent": False}]) is True)
+    check("反向顺序同样成立；全 false 才是 false",
+          sent_algo([{"possibly_sent": False}, {"possibly_sent": True}]) is True
+          and sent_algo([{"possibly_sent": False}, {"possibly_sent": False}]) is False)
     check("动作注册表覆盖了 sequence 文档里承诺的全部动作工具",
           {"click_element", "set_value", "perform_action", "select_text", "get_ax_state"} <= set(server_mod._ACTIONS))
     check("每个动作都经 action 装饰器（否则不返回 ActionResult，sequence 做不了步间决策）",
@@ -565,6 +721,61 @@ def main() -> int:
     server_mod._SETTLE_BUDGET_MS[0] = None
     check("step_timeout_ms 通过 _SETTLE_BUDGET_MS 传进 _settle（等待被预算压住）",
           budgeted <= 400, f"预算 300ms → 实际 {budgeted}ms")
+
+    # --- run_code：step_timeout_ms 压住内层 settle，结束后复位（A10） ----------------
+    @action_layer.action(risk=False)
+    def _probe_settle():
+        ms = server_mod._settle()
+        return _AR(ok=True, detail={"ms": ms})
+
+    server_mod._ACTIONS["probe_settle"] = action_layer.ActionSpec(
+        name="probe_settle", fn=_probe_settle, render=lambda r: "probe", description="", risk=False
+    )
+    server_mod._CODE_API["probe_settle"] = _probe_settle
+    try:
+        probe = server_mod._ACTIONS["run_code"].fn(code="mu.probe_settle()\n", step_timeout_ms=300)
+        probe_rec = (probe.detail.get("records") or [{}])[0]
+        check("run_code 的 step_timeout_ms 真的压住内层 _settle（300ms 预算）",
+              probe.ok and (probe_rec.get("settle_ms") or 9999) <= 500,
+              f"ok={probe.ok} settle_ms={probe_rec.get('settle_ms')} err={probe.error}")
+        check("run_code 结束后 _SETTLE_BUDGET_MS 已复位（不会把后续动作永久压在旧值）",
+              server_mod._SETTLE_BUDGET_MS[0] is None, repr(server_mod._SETTLE_BUDGET_MS[0]))
+    finally:
+        server_mod._ACTIONS.pop("probe_settle", None)
+        server_mod._CODE_API.pop("probe_settle", None)
+
+    # --- D3：桩化 possibly_sent=True，锁住「立刻停 + 第二条没跑」 ----------------
+    @action_layer.action(risk=False)
+    def _probe_sent():
+        return _AR(ok=True, possibly_sent=True)
+
+    server_mod._ACTIONS["probe_sent"] = action_layer.ActionSpec(
+        name="probe_sent", fn=_probe_sent, render=lambda r: "probe", description="", risk=False
+    )
+    server_mod._CODE_API["probe_sent"] = _probe_sent
+    try:
+        sent_res = server_mod._ACTIONS["run_code"].fn(code="mu.probe_sent()\nmu.list_apps()\n")
+        sent_recs = sent_res.detail.get("records") or []
+        check("桩化 possibly_sent=True 后 run_code 立刻停止（账本只 1 条，第二条没跑）",
+              sent_res.possibly_sent is True and sent_res.error == "POSSIBLY_SENT"
+              and len(sent_recs) == 1 and sent_recs[0].get("tool") == "probe_sent",
+              f"sent={sent_res.possibly_sent} err={sent_res.error} records={len(sent_recs)}")
+    finally:
+        server_mod._ACTIONS.pop("probe_sent", None)
+        server_mod._CODE_API.pop("probe_sent", None)
+
+    # --- A13：code_exec 只依赖 stdlib + 本仓库模块 ---------------------------------
+    import ast as _ast_mod
+    src = (ROOT / "server" / "code_exec.py").read_text(encoding="utf-8")
+    mods = set()
+    for node in _ast_mod.walk(_ast_mod.parse(src)):
+        if isinstance(node, _ast_mod.Import):
+            mods.update(a.name.split(".")[0] for a in node.names)
+        elif isinstance(node, _ast_mod.ImportFrom) and node.module:
+            mods.add(node.module.split(".")[0])
+    local = {"action_layer", "mcp_stdio", "killswitch", "server"}
+    third = sorted(m for m in mods if m not in sys.stdlib_module_names and m not in local)
+    check("code_exec 只依赖 stdlib + 本仓库模块（没有新第三方依赖）", not third, str(third))
 
     # 急停优先级：KILLED 必须比「a11y 没有语义动作」更早命中，且一次都不下发
     killswitch.stop("wire-check 进程内演习")

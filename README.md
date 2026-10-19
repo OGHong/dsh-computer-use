@@ -76,11 +76,15 @@ sh scripts/install.sh
 | 绑定应用（同时取控制器租约） | `get_app` `focus_app` `focus_window` `release_lease` |
 | 元素路径（优先） | `get_ax_state` `elements` `click_element` `set_value` `perform_action` `select_text` |
 | 坐标路径（兜底） | `click` `drag` `scroll` `type_text` `press_key` `paste` `wait` `launch_app` |
-| 批处理与安全 | `sequence` `stop` `resume` `preview` |
+| 批处理与安全 | `sequence` `run_code` `stop` `resume` `preview` |
 | 其它 | `run_shell` `open_permission_settings` |
 
 每个工具的参数、返回的 `effect` 证据与失败码都在 [docs/DESIGN.md](docs/DESIGN.md) 里；
-`sequence` 能做的 = 工具能做的（同一份清单，见 `server/action_layer.py`）。
+`sequence` / `run_code` 能做的 = 工具能做的（同一份清单，见 `server/action_layer.py`）。
+
+`sequence` 适合 ≤5 步、步骤固定、无分支的链路；`run_code` 适合步数取决于运行结果、需要循环 /
+条件 / 校验的任务（一段脚本里动作超过约 8 个时也用它）。`run_code` 把动作投影成
+`mu.<动作名>(...)`，`run_shell` 默认不在 `mu` 上（`allow_shell=true` 才注入）。
 
 ## 设置页（设置 → 电脑操控）
 

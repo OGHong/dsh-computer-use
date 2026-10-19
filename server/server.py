@@ -66,6 +66,7 @@ from action_layer import (
 )
 from mcp_stdio import BadArgument, Blocks, Image, Server, coerce_for, pause
 
+import code_exec
 import importlib
 
 
@@ -113,6 +114,10 @@ mcp = Server(
         "每个动作会返回 effect: changed/unchanged 证据，unchanged 说明没生效，换一种方式，不要重复同一动作。"
         "连续确定的动作（点击→输入→回车）用 sequence 一次执行完：它支持全部动作工具，并可用 "
         "{\"observe\": {\"diff\": true}} 伪步在中间插一次观察（插过之后元素索引要用新的）。"
+        "程序化批处理（run_code）：≤5 步、步骤固定、无分支 → 用 sequence（更省，不起解释器）；"
+        "步数取决于运行结果、需要循环/条件/校验，或一段脚本里动作超过约 8 个 → 用 run_code"
+        "（把动作投影成 mu.<动作名>(...)，参数与同名工具一致；可直接 print，用 mu.done(value) 设置最终结果）。"
+        "run_code 支持 dry_run=true 只做静态预检；run_shell 默认不在 mu 上（allow_shell=true 才注入）。"
         "动作返回 possibly_sent: true 时，**不要重复同一动作** —— 那一步可能已经下发，"
         "先 get_ax_state 观察当前状态，再决定下一步；重复一个可能已生效的点击会造成重复提交。"
         "**绑定令牌**：get_app 与 get_ax_state 的返回里有一行 binding_id=…；后续动作（含 sequence）"
@@ -1543,7 +1548,8 @@ def sequence(steps: list, on_unchanged: str = "continue", step_timeout_ms: int =
     可用 tool：除 sequence / stop / resume / release_lease / preview 之外的任何动作工具
     （click / click_element / type_text / press_key / scroll / drag / paste / set_value /
     perform_action / select_text / launch_app / focus_app / focus_window / wait / run_shell /
-    get_app / get_ax_state / elements / list_apps / list_windows / screenshot）。
+    get_app / get_ax_state / elements / list_apps / list_windows / screenshot / run_code）。
+    run_code 也可以作为一步嵌套：它自己的墙钟/预算在内部生效，超时会作为这一步的失败返回。
 
     规则：
     1. 元素索引自**最近一次观察**（get_ax_state / elements / observe 伪步）。批处理内部不插 observe
@@ -2668,6 +2674,35 @@ _register("focus_window", _do_focus_window, _render_focus_window,
 
 #: v1 的名字，保留给 scripts/mcp_wire_check.py 与外部脚本：名字 → 动作层函数
 _SEQUENCE_TOOLS = {name: spec.fn for name, spec in _ACTIONS.items()}
+
+_register(
+    "run_code", code_exec.run_code, code_exec.render_run_code,
+    "执行一段 Python 程序，把动作投影成 mu.<动作名>(...)，用循环/条件/校验批量操作这台 Mac。\n"
+    "适用：步数取决于运行结果、需要循环/条件/分支；≤5 步且步骤固定用 sequence（更省，不起解释器）。\n"
+    "mu 的属性来自动作注册表（click、click_element、get_ax_state、set_value、list_apps …），"
+    "参数与同名工具一致；返回值是 dict（ok / effect / evidence / settle_ms / possibly_sent / error / "
+    "message / detail；观察类另有 total / returned / nodes / truncated）。可以直接 print()（stdout 最多 8KB）；"
+    "mu.done(value) 设置最终结果；mu.log(...) 等价 print。\n"
+    "观察类默认 compact：只回前 60 行；要全量把 detail 设为 \"full\"。"
+    "一次结果最多一张栅格图：脚本里多次 screenshot / get_ax_state(screenshot=true) 只附最后一张。\n"
+    "预算：wall_timeout_ms 是墙钟硬停；max_actions / max_observations 分别限制动作与观察次数；"
+    "step_timeout_ms 是内层每步的 settle 预算。\n"
+    "dry_run=true 只做静态预检（语法 / 禁用名字 / 未知动作名），不执行、不碰电脑、不需要绑定。"
+    "run_shell 默认不在 mu 上：只有 allow_shell=true 才注入。\n"
+    "元素索引自最近一次观察；mu.get_ax_state() 之后之前的索引全部作废，后续动作必须用新索引。\n"
+    "出错不静默：参数缺失/未知参数 → SCRIPT_ARGUMENT；未知动作名 → SCRIPT_UNKNOWN_ACTION；"
+    "脚本异常 → SCRIPT_ERROR（带行号）；超时 → SCRIPT_TIMEOUT；超预算 → SCRIPT_BUDGET。\n"
+    "各动作的 detail 只保留 hint / notice / hints；list_apps / list_windows / get_app / run_shell 的"
+    "主数据另以顶层字段返回。",
+    risk=True, read_only=False,
+)
+
+# 代码执行层的动作投影：名字唯一来源是 _ACTIONS，禁止手写第二份清单。
+# 自身与控制面不注入 mu；run_shell 由 code_exec 按 allow_shell 再过滤一次。
+_CODE_EXCLUDE = {"run_code", "stop", "resume", "preview", "release_lease"}
+_CODE_API = {n: s.fn for n, s in _ACTIONS.items() if n not in _CODE_EXCLUDE}
+code_exec.configure(_CODE_API, _ACTIONS, _SETTLE_BUDGET_MS,
+                    last_shot_size=lambda: _last_shot.get("size"))
 
 @mcp.tool()
 def preview(enable: bool = True) -> str:

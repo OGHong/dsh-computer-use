@@ -82,12 +82,16 @@ background apps, does not steal your mouse — preferred) and the **screenshot-c
 | Bind an app (also takes the controller lease) | `get_app` `focus_app` `focus_window` `release_lease` |
 | Element path (preferred) | `get_ax_state` `elements` `click_element` `set_value` `perform_action` `select_text` |
 | Coordinate path (fallback) | `click` `drag` `scroll` `type_text` `press_key` `paste` `wait` `launch_app` |
-| Batching and safety | `sequence` `stop` `resume` `preview` |
+| Batching and safety | `sequence` `run_code` `stop` `resume` `preview` |
 | Other | `run_shell` `open_permission_settings` |
 
 Arguments, the `effect:` evidence and failure codes are documented in
-[docs/DESIGN.md](docs/DESIGN.md); `sequence` can do everything the tools can (same registry, see
-`server/action_layer.py`).
+[docs/DESIGN.md](docs/DESIGN.md); `sequence` / `run_code` can do everything the tools can (same
+registry, see `server/action_layer.py`).
+
+Use `sequence` for short fixed chains (≤5 steps, no branches); use `run_code` when the number of
+steps depends on what the program sees and you need loops, conditions or checks. `run_code`
+projects actions as `mu.<action>(...)`; `run_shell` is not on `mu` unless `allow_shell=true`.
 
 ## Settings page
 
