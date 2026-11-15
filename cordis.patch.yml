@@ -33,9 +33,9 @@
     # 本插件自身的 Host 半区（lib/index.js，由 src/index.ts 构建而来）：挂
     # /_computer-use/stream、/_computer-use/preview.jpg、/_computer-use/status.json
     # 三条路由（给预览浮窗与（退休的）内嵌卡片供帧和状态），外加设置页
-    # （Settings → 电脑操控）用的 settings.json / permissions，以及导航图标补丁的自检上报
-    # nav-icon —— 见 README「设置页」一节。客户端半区是 client/settings.js
-    # （package.json 的 dsh.client）。
+    # （Settings → 电脑操控）用的 settings.json / permissions —— 见 README「设置页」一节。
+    # 客户端半区是 client/settings.js（package.json 的 dsh.client），导航行图标走官方槽位
+    # settings.section.icon（DSH 0.2.2 起），不再有自检上报端点。
     # 它同时负责帧管线（定时器 + SCK 抓屏子进程），这些都挂在 ctx.effect 上，
     # 插件卸载或热替换时一起归还 —— 抓屏进程漏掉会让系统录屏灯一直亮。
     - id: computer-use-host

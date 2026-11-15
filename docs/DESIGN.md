@@ -436,7 +436,6 @@ HTTP 契约（同源，走 `connection.admit`，与 `/stream`、`/status.json` �
 GET  /_computer-use/settings.json   → { settings, runtime, choices, paths }
 POST /_computer-use/settings.json   → 部分字段即可；坏值保留原值、坏 JSON 400
 POST /_computer-use/permissions     → 打开系统设置的辅助功能面板（DSH_CUA_NO_OPEN=1 时不弹窗）
-POST /_computer-use/nav-icon        → 导航图标补丁的自检上报（写 <BASE>/nav-icon.log，超 8KB 留尾部）
 ```
 
 客户端半区是**手写**的 bundle（`client/settings.js`，没有构建步骤）：一页而已，用不上打包器；它只
@@ -452,51 +451,59 @@ require 平台 seed 词（`react` + `@deepseek-ai/dsh-client-ui-primitives`）�
     （浮窗上的 × 已经管这件事，设置页不再放镜像入口；`POST /_computer-use/panel` 随之删除，
     `panel.conf` 的 `hideRequest` 现在只由「关掉总开关」产生）；
   * **用词规范化**：页面上不再出现口语的「这一轮」，统一成产品自己的说法「回合」；
-    状态文案改成「运行中（显示）/（已收起）/ 未运行（下次操作时自动启动）/ 已关闭（不再自动显示）」。`scripts/settings-smoke.mjs` 钉住四件事：注册进 `settings.section`
-（id/order/label）、开关与状态反映的是哪份状态、点一下发出的请求长什么样、拿不到宿主时不崩。
+    状态文案改成「运行中（显示）/（已收起）/ 未运行（下次操作时自动启动）/ 已关闭（不再自动显示）」。`scripts/settings-smoke.mjs` 钉住五件事：注册进 `settings.section`
+（id/order/label）与它的图标（`settings.section.icon`，同 id）、开关与状态反映的是哪份状态、
+点一下发出的请求长什么样、拿不到宿主时不崩、老壳没有图标位时安静降级。
 
 **新增或改动客户端半区后必须重启一次 DeepSeek Harness**：客户端清单在宿主启动时扫描并缓存
 （`dsh-client-modules` 的 `pkgMeta` 按 `baseUrl\0loaderName` 记住结论），改 `package.json` 里的
 `dsh.client` 不会热生效。
 
-### 导航图标：为什么设置页要自己动手补一个
+### 导航图标：官方槽位 `settings.section.icon`（0.2.2 起）
 
-设置导航那一行的图标是壳里写死的一张 `id → 图标` 表（`navIcon(id)`，未命中就兜底成齿轮），而设置页
-注册项只有 `id` / `order` / `label` —— **平台没有给第三方设置页留图标位**。那张表在**应用自带的
-asar 里**：桌面版把 `/assets` 与所有 `@deepseek-ai/*` 客户端包都从 `app.asar/dsh` 发（profile 里那份
-同名包**根本不会被读** —— 实测它的 atime 停在安装那天），asar 又是应用签名的一部分，改不得。所以只剩
-一条路：**在页面里给那一行补图标**（`client/settings.js` 的 `installNavIcon`）。
+**0.2.2 之前**平台没给第三方设置页留图标位：壳的 `navIcon(id)` 是一张写死的 `id → 图标` 表，未命中
+就兜底成齿轮，而 `settings.section` 的注册项只有 `id` / `order` / `label`。0.10.0 为此在页面里补过
+一版「把兜底齿轮藏起来、行首插一个自己的图标」的 DOM 补丁（MutationObserver + `react-dom`），还带一
+条 `/_computer-use/nav-icon` 自检上报写 `<BASE>/nav-icon.log`。**0.12.0 起这些全部删除** —— 平台补
+上了图标位，补丁既没必要，也正是它让「图标还是齿轮」这类问题只能靠页面自检去猜。
 
-它的几条克制原则：
+现在的做法只有一句注册：
 
-* **只认结构，不认壳的哈希类名** —— 优先认「设置对话框（`[role="dialog"]`）里、文本完全等于本页
-  label、行首就是图标 svg、行高 40px（壳的导航行规格）」这四条；四条全中才动手。壳哪天改了行高或
-  图标不再是第一个子元素，再退一步按「文本 + 行里有图标」认（`scripts/settings-smoke.mjs` 里对两遍
-  匹配都有用例，还有「文本一样但没有图标」「文本一样但行高不对」两个诱饵，断言严格那一遍一个都不碰）；
-* **壳重渲染会换掉那一行**（切语言、关掉再打开设置面板），所以挂一个 body 级 MutationObserver 防抖
-  补一次，自己插入的节点带 `data-cu-nav-icon` 标记，绝不重复插；
-* **卸载时全部还原**（图标卸载、齿轮复原、观察器断开），冒烟用例逐条钉住。
+```js
+ctx.slots.inject('settings.section.icon', () =>
+  ctx.slots.register({ name: 'settings.section.icon', id: MODULE_ID, order: 2 }, ComputerGlyph)
+)
+```
 
-补丁**补不上时会留下现场**：`/_computer-use/nav-icon` 把结论追加到 `<BASE>/nav-icon.log`
-（补上了记一行 `patched`；设置对话框开着却认不出那一行，记一行 `probe` 并带上本页 label、对话框数、
-按钮文本抽样）—— 失败时页面上看不出任何区别，全靠这一行才知道为什么。日志超过 8KB 只留尾部。
+* **注册 id 必须等于 `settings.section` 那个 section 的 id**（这里是 `dsh-computer-use`）。壳按
+  `renderSlot('settings.section.icon', {size:16, active}, {only: row.id, fallback: navIcon(row.id)})`
+  取图标，`only` 对的是 section id；对不上的注册**永远不渲染**（`kind: list`，按 `id` 去重、按
+  `id` 过滤）。见 `@deepseek-ai/dsh-client-ui-settings` 的 README「Filling the settings slots」
+  与运行时槽位目录里的 `settings.section.icon` 条目。
+* **只画字形**：组件拿到 `{ size, active }`，按钮、文案、`aria-hidden` 包装都归壳。所以
+  `client/settings.js` 里的 `ComputerGlyph` 只认 `size`；`active` 不用自己换算成颜色 —— 壳给导航
+  行设的 `color` 会一路继承，`currentColor` 自动跟上选中态与深色主题，与官方 `navIcon(id)` 一致。
+* **失败只等于「没有自定义图标」**：整段注册裹在 `try/catch` 里。更老的 dsh 没有这个槽位
+  （`inject` 抛或 `register` 抛）时，设置页与词典照常完成注册，异常绝不外抛 ——
+  `scripts/settings-smoke.mjs` 对「inject 抛」「register 抛」两种老壳各有一条用例。
 
-图标是**自己画的**（`client/settings.js` 的 `ComputerIcon`）：运行时那 188 个图标里没有
-电脑 / 显示器 / 笔记本（只有仪表、滑块、面板、全屏、检查这一类），而这一栏就是「电脑操控」，
-所以照壳自己的画法画了一台显示器 —— `viewBox 0 0 16 16`、`fill: none`、每条 path
+图标仍然是**自己画的**（`client/settings.js` 的 `ComputerGlyph`，旧名 `ComputerIcon`）：运行时那
+188 个图标里没有电脑 / 显示器 / 笔记本（只有仪表、滑块、面板、全屏、检查这一类），而这一栏就是
+「电脑操控」，所以照壳自己的画法画了一台显示器 —— `viewBox 0 0 16 16`、`fill: none`、每条 path
 `stroke: currentColor`、线宽取 primitives 的 `ICON_MEDIUM_STROKE`（1.3，与相邻图标同粗细），
 也不额外设 linecap（壳的图标都是默认方头）。形状：机身（圆角矩形）+ 支颈 + 底座，共三条描边，
-冒烟里逐条钉住（viewBox / fill / stroke / aria-hidden / 描边条数）。
+冒烟里逐条钉住（`size` 驱动宽高 / viewBox / fill / 3 条 currentColor 描边 / 线宽 / `aria-hidden`）。
 
 **为什么不自选现成图标**：运行时图标集是 188 个、`…OutlineMedium` / `…OutlineRegular` 两档，
 里面**没有电脑 / 显示器 / 笔记本**。中间试过让设置页自己选（7 个候选 + 偏好项 + 实时重画），
 用户 2026-10-12 明确不要这种，于是收掉，直接定成自绘的这一台。
 
-**教训（两次白重启换来的）**：磁盘上有**两份** `@deepseek-ai/*` 客户端包 —— 页面真正加载的是
-**asar 里那份**（profile 里同名包的命名与 tree-shaking 范围都不一样，实测 atime 停在安装那天）。
+**教训（两次白重启换来的，仍然有效）**：磁盘上有**两份** `@deepseek-ai/*` 客户端包 —— 页面真正加载
+的是 **asar 里那份**（profile 里同名包的命名与 tree-shaking 范围都不一样，实测 atime 停在安装那天）。
 第一版照着 profile 那份挑了 `IconGaugeOutline16`，真机上根本没这个名字，图标怎么改都不生效。
-所以 `scripts/settings-smoke.mjs` 里那张运行时导出表（282 个名字）是按 **asar 那份**生成的，
-页面用到的每个 `prims.X` 都要在表里 —— 换 dsh 版本后重新生成，别凭 profile 或 README 猜。
+所以 `scripts/settings-smoke.mjs` 里那张运行时导出表是按 **asar 那份**生成的（0.12.0 随
+`dsh@0.2.2-rc.3` 重新生成，320 个导出；0.2.0-rc.2 那版是 282 个），页面用到的每个 `prims.X`
+都要在表里 —— **换 dsh 版本后重新生成**，别凭 profile 或 README 猜。
 
 ## 轻量（实测数字）
 
@@ -553,6 +560,81 @@ ZCode 的 computer-use 进程本机当前没在跑，量不到，只作为形态
 `_settle()` 自适应等稳定（先给 250ms 下限，之后每 120ms 采一次界面指纹，连续两次一致
 就返回，最多仍不超过 600ms），以及 `_activate_pid` 用轮询前台 pid 代替固定睡 350ms。
 读不到 AX 或没绑定应用时 `_settle()` 退回原来的固定停顿，所以只会更快、不会更糙。
+
+## 与 DSH 版本对齐（0.2.2 审计）
+
+### 版本（0.12.0）
+
+| 项 | 值 | 依据 |
+|---|---|---|
+| 插件版本 | `0.12.0` | 图标换官方槽位 + 兼容性对齐 |
+| `engines.dsh` | `>=0.2.2-rc.3` | 实测运行 `dsh@0.2.2-rc.3`、`cordis@4.1.0` |
+| `@deepseek-ai/cordis`（peer） | `~4.1.0` | 0.2.2 自带 cordis **4.1.0**（旧声明 `~4.0.4` 已不匹配）；`dsh` 自己的 peer 也是 `~4.1.0` |
+| 三个 `@deepseek-ai/dsh-client-*`（peer） | `^0.2.2` | 客户端包与宿主同版本号（实测三个都是 `0.2.2-rc.3`） |
+| `engines.node` | `>=22.6`（不变） | 只描述构建工具链；DSH 自身要求 Node 24.9+（见 v0.2.1-rc.2 的 `node-24` 指南），那是 DSH 的事 |
+
+**真正拦人的是 `engines.dsh`**：`dsh-app-boot` 的 `unmetRequirements()` 里，只要插件声明了
+`engines.dsh`，它就**单独决定**加载与否，`peerDependencies` 不再参与判断（peer 只留给 pnpm 解析）。
+所以 `>=0.2.2-rc.3` 是那道门，peer 只是对齐用的元数据。
+
+### 升级指南逐条审计
+
+审计范围：`docs/upgrade-guide/` 的 `v0.2.2-alpha.2`、`v0.2.2-alpha.3`、`v0.2.2-rc.1` 三个目录（共 46 条）。
+本插件的外部面只有三样：客户端 `slots` + `locale` 注入、宿主 `connection` + `webServer` 服务与
+`tools/*` 事件、自己的 Python MCP 服务器（`server/`）。
+
+| 指南 | 结论 | 证据（插件侧） |
+|---|---|---|
+| alpha.2 `context-menu-target` | 不适用 | 不用右键菜单：客户端只取 `Switch`/`Pill`/`Button`/`StateDot`（`client/settings.js:131-132` 的 seed 词 + `settings-smoke.mjs` 的运行时导出表守卫），无 `MenuTarget` / `contextMenu.icon` |
+| alpha.2 `cordis-loader-entry-trees` | 不适用 | 不实现 Loader 条目树：宿主只用 `ctx.effect` / `ctx.on` / `ctx.inject`（`src/index.ts:1255`），无 `commit(change)` |
+| alpha.2 `css-anchored-menus` | 不适用 | 无 JS 面板定位、无 `Menu` 矩形回调（同上，页面只有卡片与 primitives） |
+| alpha.2 `cua-source-dev-helper` | 不适用 | 不用 DSH 的 CUA helper：抓屏 helper 是自己编的 `bin/cua_capture`（`scripts/build_capture.sh:2`），bundle id 与 DSH 无关 |
+| alpha.2 `desktop-stable-channel` | 不适用 | 不读更新渠道/`dshDesktop`（`grep -c dshDesktop` = 0/0） |
+| alpha.2 `forge-git-permissions` | 不适用 | 不用 Forge 的 Git 查询 |
+| alpha.2 `forge-worktree-entry` | 不适用 | 同上（无 Forge 面） |
+| alpha.2 `fs-observation-policy-default-off` | 不适用 | 不注册 DSH 的 `write`/`edit`/`apply_patch`；`run_shell` 是自家 MCP 工具（`server/action_layer.py`） |
+| alpha.2 `llm-error-builtin-codes` | 不适用 | 不构造 `LlmError`、不发起 LLM 请求 |
+| alpha.2 `llm-request-purpose-declarations` | 不适用 | 同上 |
+| alpha.2 `pi-ai-request-image-count` | 不适用 | 不经 pi-ai 路由 |
+| alpha.2 `projection-event-frames` | 不适用 | 不消费 Session projection（`grep -c sessionProjections` = 0） |
+| alpha.2 `projection-released-checkpoint` | 不适用 | 同上 |
+| alpha.2 `projection-snapshot-scope` | 不适用 | 同上 |
+| alpha.2 `retained-ptc-timeout` | 不适用 | 插件的 `run_code` 是自家 MCP 工具（`server/code_exec.py`），不是 DSH 的 Node PTC 执行器 |
+| alpha.2 `schedule-agent-tools` | 不适用 | 不注册 schedule 工具 |
+| alpha.2 `schedule-remote-host-tasks` | 不适用 | 同上 |
+| alpha.2 `sdk-run-commands` | 不适用 | 不用 SDK run |
+| alpha.2 `session-header-menu` | 不适用 | 本插件是 bundle 里的一段客户端注册，不是自定义 Web 组合，也不提供会话操作菜单 |
+| alpha.2 `subagent-explicit-reasoning` | 不适用 | 不创建 subagent（`grep -c subagent` = 0/0） |
+| alpha.2 `web-search-credential-modes` | 不适用 | 不接搜索/抓取提供方 |
+| alpha.2 `web-search-default-provider` | 不适用 | 同上 |
+| alpha.3 `chat-process-activity-context` | 不适用 | 不渲染聊天界面（只有设置页） |
+| alpha.3 `office-kit-package` | 不适用 | 不用 Office 包 |
+| alpha.3 `office-operation-tools` | 不适用 | 同上 |
+| alpha.3 `office-skill-resources` | 不适用 | 插件不带 skill（`package.json` 的 `files` 里没有 skills 目录） |
+| alpha.3 `subagent-names` | 不适用 | 不用 subagent 工具 |
+| rc.1 `account-notification-fields` | 不适用 | 不消费账号通知 |
+| rc.1 `account-remote-provider` | 不适用 | 不接账号服务 / Remote 导入 |
+| rc.1 `archive-worktrees` | 不适用 | 不用 worktree 服务 |
+| rc.1 `attachment-error-codes` | 不适用 | 不构造 `AttachmentError`、不读附件 |
+| rc.1 `cua-ax-read-limits` | 不适用 | 不用 DSH 的 CUA 服务：AX 读取全在自家 Python 侧（`server/ax_bridge.py`），宿主 `ctx.inject` 只有 `connection`/`webServer`（`src/index.ts:1255`） |
+| rc.1 `cua-hover-ax-only` | 不适用 | `hover` 是插件自己的动作（`server/action_layer.py`），不经过 DSH 的 `mouseMove` |
+| rc.1 `cua-native-platform` | 不适用 | 不写 CUA 脚本、不实现自定义原生提供方 |
+| rc.1 `dsh-doc-skill` | 不适用 | 插件不带 skill（同 alpha.3 `office-skill-resources`） |
+| rc.1 `forge-change-request-overview` | 不适用 | 无 Forge 面 |
+| rc.1 `forge-pinned-diff` | 不适用 | 同上 |
+| rc.1 `forge-review-reads` | 不适用 | 同上 |
+| rc.1 `plugin-update-method` | 不适用 | 不读 `listBundles()`：`grep -c "listBundles\|BundleInfo\|updatable"` = 0/0；安装走自己的 `scripts/install.sh`（改写 profile 的 `package.json`），与 `plugin_manager` 无关 |
+| rc.1 `runtime-context-reminders` | 不适用 | 不写运行时上下文日志 |
+| rc.1 `session-append-overloads` | 不适用 | 不包装 `Session.append`：`grep -c "session.append"` = 0/0 |
+| rc.1 `subagent-interrupt-default` | 不适用 | 不用 subagent / Team |
+| rc.1 `terminal-backend-cleanup-error` | 不适用 | 不用 DSH 终端后端（`run_shell` 是自家工具） |
+| rc.1 `terminal-bundle-sidebar-backend` | 不适用 | 同上 |
+| rc.1 `web-search-billing` | 不适用 | 不接搜索/抓取提供方 |
+| rc.1 `window-drag-regions` | 不适用 | 这一页是**普通设置 section**（`client/settings.js:440` 注册进 `settings.section`，由壳渲染在对话框内容列里），不是覆盖可拖拽标题栏的自定义浮层，也没有 `data-window-drag`（grep = 0）。插件唯一的“浮层”是 Python 原生观察窗（`server/preview_window.py`），在 Web 层之外 |
+| （无指南）`settings.section.icon` | **适用，已落地** | 0.2.2 新增的官方图标位，只在包文档与运行时槽位目录里公布，没有 upgrade-guide 条目。证据：`dsh-client-ui-settings-general/lib/client.js` 声明 `{kind:'list',scope:'root',inline:true}` 并以 `renderSlot('settings.section.icon',{size:16,active},{only:row.id,fallback:navIcon(row.id)})` 渲染；`dsh-client-ui-settings/README.md:47`（注册 id 必须等于 section id）；运行时目录 `dsh-cordis-client-runner/lib/client.js:1750` |
+
+**结论**：46 条指南里没有一条要求本插件改代码；唯一真正要跟的是那个**没有指南**的新槽位
+`settings.section.icon`，已经在 0.12.0 用它替换了旧的 DOM 补丁（见上一节）。
 
 ## 开发与校验
 

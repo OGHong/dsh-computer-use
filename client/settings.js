@@ -11,7 +11,8 @@
  *   * 观察窗当前状态与最近一次电脑操作；
  *   * 首次使用要开的两项系统权限（含一键打开系统设置面板）。
  *
- * 另外顺手补一件事：设置导航里「电脑操控」那一行的图标（平台没有图标位，见 `installNavIcon`）。
+ * 另外顺手补一件事：设置导航里「电脑操控」那一行的图标 —— 走平台的官方槽位
+ * `settings.section.icon`（0.2.2 起有），组件是下面的 `ComputerGlyph`。
  *
  * 观察窗那两个临时动作（右上 × = 本回合不再显示、左上 ⏹ = 急停）留在窗口自己身上：
  * 设置页不放它们的镜像入口（用户 2026-10-12 的要求），只保留**粘性**的那个总开关。
@@ -126,19 +127,12 @@ window.__ModuleLoader__?.load({
     // 样式随壳的样式表一起加载），所以这里不需要 CSS 也不引入额外依赖。
     let React = null
     let prims = null
-    let ReactDOM = null
     try {
       React = require('react')
       prims = require('@deepseek-ai/dsh-client-ui-primitives')
     } catch {
       React = null
       prims = null
-    }
-    // `react-dom/client` 只为下面那个「导航行图标」用：拿不到就不补图标，这一页照常。
-    try {
-      ReactDOM = require('react-dom/client')
-    } catch {
-      ReactDOM = null
     }
 
     const h = React ? React.createElement : null
@@ -383,27 +377,16 @@ window.__ModuleLoader__?.load({
     }
 
     /**
-     * 设置导航里那一行的图标 —— 平台没有图标位，所以由这一半区自己补。
+     * 导航行图标：一台显示器 —— **自己画的**，但走平台的官方槽位。
      *
-     * 导航图标是壳里写死的一张 `id → 图标` 表（未命中就兜底成齿轮），而设置页注册项只有
-     * `id` / `order` / `label`。那张表在**应用自带的 asar 里**：桌面版把 `/assets` 与所有
-     * `@deepseek-ai/*` 客户端包都从 `app.asar/dsh` 发（profile 里那份同名包根本不会被读，
-     * 实测 atime 停在安装那天），而 asar 是签名的一部分，改不得。所以只剩一条路：在页面里给
-     * 那一行补图标 —— 把壳的兜底齿轮藏起来，在它前面放上我们自己的图标。
+     * 0.2.2 起壳给了官方图标位：`settings.section.icon`（`kind: list`；注册项的 `id` 必须等于
+     * 设置 section 的 `id`，对不上就根本不渲染 —— 见 `@deepseek-ai/dsh-client-ui-settings`
+     * 的 README）。按钮、文案与无障碍包装都归壳，交给组件的只有 `{ size, active }`，所以这一
+     * 半区只负责画字形，**不再碰 DOM**：旧版那套 MutationObserver + react-dom 的「补图标」补丁
+     * 随 0.2.2 一起删掉了。
      *
-     * 三条克制原则：
-     *
-     *   * **只认结构，不认壳的哈希类名**：对话框（`[role=dialog]`）里、文本完全等于本页
-     *     label、第一个子元素是 svg、行高 40px（壳的导航行规格）—— 四条全中才动手，
-     *     否则一个节点都不碰；
-     *   * **壳重渲染会换掉那一行**（切语言、关掉再打开设置面板），所以挂一个 body 级
-     *     MutationObserver 防抖补一次；自己插入的节点带标记，绝不重复插；
-     *   * **卸载时全部还原**：图标卸载、齿轮复原、观察器断开。
-     *
-     * 任何一步失败都只是「没有自定义图标」，不影响这一页本身。
-     */
-    /**
-     * 导航行图标：一台显示器 —— **自己画的**。
+     * 颜色走 `currentColor`：壳给导航行设的 `color` 会一路继承下来，选中态与深色主题都自动跟上，
+     * 与官方图标同一套规则 —— 所以 `active` 不用自己换算成颜色或粗细。
      *
      * 为什么自己画：运行时那 188 个图标里没有电脑 / 显示器 / 笔记本（有仪表、滑块、面板、全屏、
      * 检查……），而这一栏就是「电脑操控」。所以照壳自己的画法画一个 16×16：`viewBox 0 0 16 16`、
@@ -413,13 +396,19 @@ window.__ModuleLoader__?.load({
      */
     // 注意 seed 词缺失时 prims 是 null：这一行在模块加载时就跑，必须自己判空（否则整页被带崩）
     const MEDIUM_STROKE = prims && typeof prims.ICON_MEDIUM_STROKE === 'number' ? prims.ICON_MEDIUM_STROKE : 1.3
-    const ComputerIcon = ({ size = 16, className }) =>
+
+    /**
+     * 槽位组件：壳传 `{ size, active }`，这里只用 `size`（16）。
+     *
+     * `active` 刻意不参与绘制 —— 颜色已经由外层导航行的 `color` 定好（`currentColor` 直接继承），
+     * 官方那张 `navIcon(id)` 表也只认 `size`；自己再画一档只会在切页时抖一下。
+     */
+    const ComputerGlyph = ({ size = 16 }) =>
       h(
         'svg',
         {
           width: size,
           height: size,
-          className,
           viewBox: '0 0 16 16',
           fill: 'none',
           xmlns: 'http://www.w3.org/2000/svg',
@@ -433,157 +422,6 @@ window.__ModuleLoader__?.load({
         h('path', { d: 'M8 11.1V13.3', stroke: 'currentColor' }),
         h('path', { d: 'M5.6 13.5H10.4', stroke: 'currentColor' })
       )
-
-    /**
-     * 设置导航里那一行的图标 —— 平台没有图标位，所以由这一半区自己补。
-     *
-     * 导航图标是壳里写死的一张 `id → 图标` 表（未命中就兜底成齿轮），而设置页注册项只有
-     * `id` / `order` / `label`。那张表在**应用自带的 asar 里**：桌面版把 `/assets` 与所有
-     * `@deepseek-ai/*` 客户端包都从 `app.asar/dsh` 发（profile 里那份同名包根本不会被读，
-     * 实测 atime 停在安装那天），而 asar 是签名的一部分，改不得。所以只剩一条路：在页面里给
-     * 那一行补图标 —— 把壳的兜底齿轮藏起来，在它前面放上我们自己的图标。
-     *
-     * 三条克制原则：
-     *
-     *   * **只认结构，不认壳的哈希类名**：对话框（`[role=dialog]`）里、文本完全等于本页
-     *     label、第一个子元素是 svg、行高 40px（壳的导航行规格）—— 四条全中才动手，
-     *     否则一个节点都不碰；
-     *   * **壳重渲染会换掉那一行**（切语言、关掉再打开设置面板），所以挂一个 body 级
-     *     MutationObserver 防抖补一次；自己插入的节点带标记，绝不重复插；
-     *   * **卸载时全部还原**：图标卸载、齿轮复原、观察器断开。
-     *
-     * 任何一步失败都只是「没有自定义图标」，不影响这一页本身。
-     */
-    const NAV_MARK = 'data-cu-nav-icon'
-
-    function installNavIcon(translate, reactDom) {
-      if (typeof document === 'undefined' || typeof MutationObserver === 'undefined') return () => {}
-      if (!h) return () => {}
-      if (!reactDom || typeof reactDom.createRoot !== 'function') return () => {}
-
-      /** 当前补过的那一行（壳重渲染后节点会脱离文档，靠 isConnected 判断该收掉）。 */
-      let live = null
-      let timer = 0
-      let reported = false
-      let probes = 0
-
-      /**
-       * 自检上报：补上了记一行；**设置对话框开着却认不出那一行**也记一行，带上现场。
-       *
-       * 为什么值得写：这个补丁失败时页面上看不出任何区别（还是壳的兜底齿轮），而失败原因只有
-       * 页面自己知道。Host 半区把它追加到 `<BASE>/nav-icon.log`（`/_computer-use/nav-icon`），
-       * 于是「为什么图标还是齿轮」有据可查，而不是靠猜。上报本身失败无所谓。
-       */
-      const report = (outcome, detail) => {
-        try {
-          const pending = fetch(`${CHANNEL}/nav-icon`, {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ outcome, detail })
-          })
-          if (pending && typeof pending.catch === 'function') pending.catch(() => {})
-        } catch {
-          /* 诊断而已，不上报也没关系 */
-        }
-      }
-
-      const undo = () => {
-        if (!live) return
-        const { holder, root, gear } = live
-        live = null
-        try {
-          root.unmount()
-        } catch {
-          /* 行可能已经被壳删掉了，卸载失败无所谓 */
-        }
-        if (gear && gear.isConnected) gear.style.removeProperty('display')
-        if (holder.isConnected) holder.remove()
-      }
-
-      /** 把一行改成我们的图标：藏掉壳的兜底图标，在行首放上我们的。 */
-      const decorate = (row, gear) => {
-        const holder = document.createElement('span')
-        holder.setAttribute(NAV_MARK, '')
-        holder.style.cssText = 'display:inline-flex;flex:none;width:16px;height:16px'
-        if (gear) gear.style.display = 'none'
-        row.insertBefore(holder, row.firstChild)
-        const root = reactDom.createRoot(holder)
-        root.render(h(ComputerIcon, { size: 16 }))
-        live = { row, holder, root, gear }
-        if (!reported) {
-          reported = 'patched'
-          report('patched', `computer-icon label=${String(translate('section'))}`)
-        }
-      }
-
-      /** 壳的兜底图标：行里第一个 svg 子元素（没有就返回 null）。 */
-      const shellIcon = (row) => {
-        for (const child of row.children) {
-          if (child.tagName && child.tagName.toLowerCase() === 'svg') return child
-        }
-        return null
-      }
-
-      const patch = () => {
-        timer = 0
-        // 行被壳换掉、或壳重渲染时把我们插的节点摘掉了 → 收掉重补
-        if (live && (!live.row.isConnected || !live.holder.isConnected)) undo()
-        if (live) return
-        const label = String(translate('section'))
-
-        const dialogs = document.querySelectorAll('[role="dialog"]')
-
-        // 第一遍（严格）：设置对话框里的导航行 —— 文本完全等于本页 label、行首就是图标、
-        // 行高 40px（壳的导航行规格）。四条全中才动手，绝不误伤别的按钮。
-        for (const dialog of dialogs) {
-          for (const row of dialog.querySelectorAll('button')) {
-            if (row.textContent.trim() !== label) continue
-            const gear = row.firstElementChild
-            if (!gear || gear.tagName.toLowerCase() !== 'svg') continue
-            if (Math.round(row.getBoundingClientRect().height) !== 40) continue
-            decorate(row, gear)
-            return
-          }
-        }
-
-        // 第二遍（宽松）：壳换了行高或图标不再是第一个子元素时，靠「文本 + 行里有图标」认。
-        // 只在严格匹配一个都没命中时才走这一步 —— 宁可图标晚一拍补上，也不要因为壳改了
-        // 一个数值就永远补不上（这一轮就是这么白重启过两次的）。
-        for (const row of document.querySelectorAll('button')) {
-          if (row.textContent.trim() !== label) continue
-          const gear = shellIcon(row)
-          if (!gear) continue
-          decorate(row, gear)
-          return
-        }
-
-        // 两遍都没认出来，而设置对话框明明开着 → 这就是「图标补不上」的现场，记一次（最多三次，
-        // 免得开关面板时把日志刷满）：按钮文本抽样最能说明问题（文案变了？结构变了？）。
-        if (dialogs.length > 0 && probes < 3) {
-          probes += 1
-          const buttons = [...document.querySelectorAll('button')]
-          const sample = buttons
-            .map((button) => String(button.textContent || '').trim().slice(0, 24))
-            .filter(Boolean)
-            .slice(0, 8)
-            .join(' | ')
-          report('probe', `label=${label} dialogs=${dialogs.length} buttons=${buttons.length} sample=${sample}`)
-        }
-      }
-
-      const schedule = () => {
-        if (!timer) timer = setTimeout(patch, 150)
-      }
-      const observer = new MutationObserver(schedule)
-      observer.observe(document.body, { childList: true, subtree: true })
-      schedule()
-
-      return () => {
-        observer.disconnect()
-        if (timer) clearTimeout(timer)
-        undo()
-      }
-    }
 
     const name = MODULE_ID
     // 设置页与「通用」设置同一个槽位；locale 提供中英词典，slots 提供注册面。
@@ -599,12 +437,6 @@ window.__ModuleLoader__?.load({
       } catch {
         /* 没有 locale 就用 key 本身：这一页宁可显示英文 key，也不该整个不出现 */
       }
-      // 导航行图标：平台没给第三方设置页留图标位，自己补一个（见 installNavIcon）。
-      try {
-        ctx.effect(() => installNavIcon(translate, ReactDOM), 'computer-use: nav icon')
-      } catch {
-        /* 补不上就还是壳的兜底齿轮，不影响这一页 */
-      }
       ctx.slots.inject('settings.section', () =>
         ctx.slots.register(
           {
@@ -618,13 +450,23 @@ window.__ModuleLoader__?.load({
           ComputerUseSettings
         )
       )
+      // 导航行图标：官方槽位 `settings.section.icon`（0.2.2 起），注册 id 必须与上面那个
+      // section 的 id 相同（壳按 id 取图标，对不上就退回自己的兜底齿轮）。
+      // 更老的 dsh 没有这个槽位：拿不到就只是没有自定义图标，这一页照常 —— 所以整段吞异常。
+      try {
+        ctx.slots.inject('settings.section.icon', () =>
+          ctx.slots.register({ name: 'settings.section.icon', id: MODULE_ID, order: 2 }, ComputerGlyph)
+        )
+      } catch {
+        /* 没有图标位就还是壳的兜底齿轮，不影响这一页 */
+      }
     }
 
     exports.name = name
     exports.inject = inject
     exports.apply = apply
     // 冒烟检查用：不改行为，只把这一页的字典与组件暴露出来（scripts/settings-smoke.mjs）
-    exports.__internals = { ZH, EN, ComputerUseSettings }
+    exports.__internals = { ZH, EN, ComputerUseSettings, ComputerGlyph }
     return module.exports
   }
 })

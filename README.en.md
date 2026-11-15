@@ -25,10 +25,18 @@ the state of the two macOS permissions.
 | OS | macOS 13+ (Intel or Apple Silicon) |
 | Python | 3.10+ (3.12 is what it is tested on; the python.org framework build is best) |
 | Node | 22+ with npm (to build the host half; `lib/` is a build artifact and is not in the repo) |
-| DeepSeek Harness | **0.2.0-rc.2 or newer (0.2.x)** — declared in `peerDependencies`; DSH refuses to load it on an incompatible version |
+| DeepSeek Harness | **0.2.2-rc.3 or newer (0.2.x)** — declared in `engines.dsh`; DSH refuses to load it on an incompatible version. Peers are aligned with cordis 4.1 and the 0.2.2 client packages |
 | Permissions | Accessibility + Screen Recording, see below |
 | Disk | ~130 MB (`.venv` is 96 MB of that) |
 | Optional | Xcode Command Line Tools — only to compile the capture helper; without it the plugin falls back to `screencapture` |
+
+**DSH 0.2.2 compatibility (0.12.0)**: aligned with `dsh@0.2.2-rc.3` — `engines.dsh: >=0.2.2-rc.3`,
+`@deepseek-ai/cordis ~4.1.0`, and `^0.2.2` for the three client packages. The settings-nav icon now
+comes from the official `settings.section.icon` slot (the old DOM patch and its
+`/_computer-use/nav-icon` self-check channel are gone). All 46 upgrade guides for the three 0.2.2
+releases were audited one by one: window drag regions, `cua-*`, the plugin update API, the
+`Session.append` overloads and the rest **do not apply** — reasons and evidence are in
+[docs/DESIGN.md](docs/DESIGN.md), section 「与 DSH 版本对齐（0.2.2 审计）」.
 
 ## Install
 

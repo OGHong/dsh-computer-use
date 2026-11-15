@@ -22,10 +22,17 @@ Agent 每次碰电脑时，屏幕上会浮出一块**观察窗**，实时显示�
 | 系统 | macOS 13+（Intel / Apple Silicon 都可以） |
 | Python | 3.10+（实测 3.12 最稳；python.org 的 framework 版最好） |
 | Node | 22+ 与 npm（构建 Host 半区用；`lib/` 是产物，不在仓库里） |
-| DeepSeek Harness | **0.2.0-rc.2 及以上（0.2.x）** —— 在 `peerDependencies` 里声明，不兼容的版本 DSH 会在加载前拦下 |
+| DeepSeek Harness | **0.2.2-rc.3 及以上（0.2.x）** —— 在 `engines.dsh` 里声明，不兼容的版本 DSH 会在加载前拦下；peer 与 cordis 4.1 / 客户端包 0.2.2 对齐 |
 | 系统权限 | 「辅助功能」+「屏幕录制」两项，见下 |
 | 磁盘 | 约 130MB（其中 `.venv` 96MB） |
 | 可选 | Xcode Command Line Tools —— 只为编译抓屏 helper；不装会自动退回 `screencapture` |
+
+**DSH 0.2.2 兼容性（0.12.0）**：对齐 `dsh@0.2.2-rc.3` —— `engines.dsh: >=0.2.2-rc.3`、
+`@deepseek-ai/cordis ~4.1.0`、三个客户端包 `^0.2.2`。设置导航里「电脑操控」的图标改用官方槽位
+`settings.section.icon`（旧的 DOM 补丁与 `/_computer-use/nav-icon` 自检通道已删除）。
+0.2.2 三个版本的升级指南共 46 条已逐条审计：窗口拖拽区域、`cua-*`、插件更新 API、
+`Session.append` 重载等**都不适用**，理由与证据见 [docs/DESIGN.md](docs/DESIGN.md) 的
+「与 DSH 版本对齐（0.2.2 审计）」一节。
 
 ## 安装
 

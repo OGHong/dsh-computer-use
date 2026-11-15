@@ -762,26 +762,11 @@ async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknow
 }
 
 /**
- * 设置页的三个端点（`settings.json` / `panel` / `permissions`）。
+ * 设置页的两个端点（`settings.json` / `permissions`）。
  *
  * 单独拎出来是因为它们要**异步读请求体**，而路由本身是同步的（`RouteHandler` 返回 void）：
  * 调用点用 `void` 起这条链，异常在函数内部收口成 500，绝不变成未处理的 rejection。
  */
-/**
- * 导航图标补丁的自检日志：追加一行，超过 8KB 就只留尾部 —— 这是个诊断文件，不是账本。
- * @param line - 已拼好的单行记录（调用方负责截断字段长度）。
- */
-function appendNavIconLog(line: string): void {
-  const file = `${BASE}/nav-icon.log`
-  try {
-    const previous = existsSync(file) ? readFileSync(file, 'utf8') : ''
-    const next = (previous + line + '\n').slice(-8192)
-    writeFileSync(file, next)
-  } catch (error) {
-    process.stderr.write(`dsh-computer-use: 写 nav-icon.log 失败 (${String(error)})\n`)
-  }
-}
-
 async function handleSettingsRequest(
   endpoint: string,
   req: IncomingMessage,
@@ -810,28 +795,6 @@ async function handleSettingsRequest(
       if (prefs.autoShow !== before.autoShow) applyAutoShow(prefs.autoShow)
       else writeConf()
       respondJson(res, 200, settingsPayload())
-      return
-    }
-    // nav-icon：客户端那个「导航行图标」补丁的自检上报。
-    //
-    // 为什么需要它：平台没给第三方设置页留图标位，图标只能在页面里补（见 client/settings.js 的
-    // installNavIcon），而补丁失败时**页面上什么都看不出来** —— 还是那个兜底齿轮。补不上的原因
-    // （壳改了行高、文案对不上、对话框结构变了……）只有页面自己知道，所以让它写一行到这里：
-    // 用户问「为什么图标还是齿轮」时，答案就在这个文件里。
-    if (endpoint === 'nav-icon') {
-      if (req.method !== 'POST') {
-        respondJson(res, 405, { error: 'method not allowed' })
-        return
-      }
-      const body = await readJsonBody(req)
-      if (body === null) {
-        respondJson(res, 400, { error: 'bad json body' })
-        return
-      }
-      const outcome = String(body.outcome ?? '').slice(0, 40)
-      const detail = String(body.detail ?? '').slice(0, 600)
-      if (outcome) appendNavIconLog(`${new Date().toISOString()} ${outcome} ${detail}`)
-      respondJson(res, 200, { ok: true })
       return
     }
     // permissions：指引区那个「打开辅助功能设置」按钮
@@ -1078,9 +1041,9 @@ function routeRequest(scope: HostContext, req: IncomingMessage, res: ServerRespo
     res.end(body)
     return
   }
-  // 设置页（Settings → 电脑操控）：偏好读写、打开权限面板、导航图标补丁的自检上报。
+  // 设置页（Settings → 电脑操控）：偏好读写、打开权限面板。
   // 它们要异步读请求体，所以单独走一条链；异常在那条链内部收口成 500。
-  if (endpoint === 'settings.json' || endpoint === 'permissions' || endpoint === 'nav-icon') {
+  if (endpoint === 'settings.json' || endpoint === 'permissions') {
     void handleSettingsRequest(endpoint, req, res)
     return
   }

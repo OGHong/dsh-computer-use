@@ -203,26 +203,15 @@ const badBody = await postJson('/_computer-use/settings.json', '{ 这不是 json
 if (badBody.status !== 400) throw new Error(`坏 JSON 期望 400，实际 ${badBody.status}`)
 console.log('✓ 非法值保留原值、坏 JSON 回 400（手滑一次不该把用户的设置重置掉）')
 
-// 导航图标补丁的自检上报：页面补不上时把现场写进 <BASE>/nav-icon.log（问「为什么图标还是齿轮」的答案）
-const navReport = await postJson('/_computer-use/nav-icon', {
-	outcome: 'probe',
-	detail: 'label=电脑操控 dialogs=1 buttons=9 sample=账号与余额 | 通用设置'
-})
-if (navReport.status !== 200) throw new Error(`nav-icon 上报期望 200，实际 ${navReport.status}`)
-const navLog = readFileSync(`${DIR}/nav-icon.log`, 'utf8')
-if (!navLog.includes('probe') || !navLog.includes('dialogs=1'))
-	throw new Error(`nav-icon.log 没有记下现场：${JSON.stringify(navLog)}`)
-const navBad = await postJson('/_computer-use/nav-icon', '{ 坏 json')
-if (navBad.status !== 400) throw new Error(`nav-icon 坏 JSON 期望 400，实际 ${navBad.status}`)
-if (readFileSync(`${DIR}/nav-icon.log`, 'utf8') !== navLog)
-	throw new Error('坏 JSON 也写了日志（不该留半条记录）')
-// 日志是诊断文件不是账本：超长内容只留尾部
-for (let i = 0; i < 40; i += 1) {
-	await postJson('/_computer-use/nav-icon', { outcome: 'probe', detail: 'x'.repeat(500) })
-}
-if (readFileSync(`${DIR}/nav-icon.log`, 'utf8').length > 8192)
-	throw new Error('nav-icon.log 没有截断（会无限长大）')
-console.log('✓ 导航图标自检：现场落盘、坏 JSON 回 400 不留半条、日志超过 8KB 只留尾部')
+// 导航图标改走官方槽位（settings.section.icon）之后，`/_computer-use/nav-icon` 这条诊断路
+// 应该已经**拆干净**：POST 落到「只允许 GET」的方法闸门（405），GET 落到路由末尾（404），
+// 也不该再有人往 <BASE>/nav-icon.log 里写。这条断言钉住删除，免得以后又长出第二条通道。
+const navGone = await postJson('/_computer-use/nav-icon', { outcome: 'probe', detail: 'x' })
+if (navGone.status !== 405) throw new Error(`nav-icon 端点应当已删除（POST 期望 405），实际 ${navGone.status}`)
+const navGet = await call('/_computer-use/nav-icon')
+if (navGet.status !== 404) throw new Error(`nav-icon 端点应当已删除（GET 期望 404），实际 ${navGet.status}`)
+if (existsSync(`${DIR}/nav-icon.log`)) throw new Error('nav-icon.log 又被写出来了（端点没删干净）')
+console.log('✓ 导航图标自检端点已拆除：POST → 405、GET → 404、不再写 nav-icon.log')
 
 // 关掉总开关要**真的把浮窗进程收掉**：只写文件的话，已经开着的那块窗还留在屏幕上。
 // 走用户的实际路径：先打开（这时窗可以在跑）→ 再关掉。
